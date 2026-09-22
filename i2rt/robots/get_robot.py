@@ -109,6 +109,7 @@ def get_yam_robot(
     sim: bool = False,
     joint_state_saver_factory: Optional[Callable[[], Any]] = None,
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
+    external_gripper: bool = False,
 ) -> "MotorChainRobot":
     """Create a YAM-family robot (real or sim).
 
@@ -120,12 +121,16 @@ def get_yam_robot(
         ee_mass: Optional end-effector mass override (kg) for MuJoCo inertial.
         ee_inertia: Optional 10-element inertia override [ipos(3), quat(4), diaginertia(3)].
         sim: If True, return a SimRobot instead of connecting to real hardware.
+        external_gripper: Control only the six arm motors; retain the selected
+            gripper's inertial model for a separate gripper controller.
     """
-    with_gripper = gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
+    with_gripper = not external_gripper and gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
     with_teaching_handle = gripper_type == GripperType.YAM_TEACHING_HANDLE
 
     hw = _ARM_HW_CONFIGS[arm_type]
 
+    # An external controller owns the gripper motor, but its mass remains in the
+    # arm dynamics. Passive finger joints stay at their model default pose.
     model_path = combine_arm_and_gripper_xml(arm_type.get_xml_path(), gripper_type.get_xml_path(), ee_mass, ee_inertia)
 
     joint_limits = _ARM_JOINT_LIMITS[arm_type].copy()

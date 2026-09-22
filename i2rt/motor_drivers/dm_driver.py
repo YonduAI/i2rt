@@ -417,6 +417,10 @@ class DMChainCanInterface(MotorChain):
             self.same_bus_device_driver = get_same_bus_device_driver(self.motor_interface)
         else:
             self.same_bus_device_driver = None
+            self.motor_interface.bus.set_filters([
+                {'can_id': receive_mode.get_receive_id(motor_id), 'can_mask': 0x7FF, 'extended': False}
+                for motor_id, _ in motor_list
+            ])
 
         self.absolute_positions = None
         self._motor_on()

@@ -138,12 +138,12 @@ class MotorChainRobot(Robot):
         self._gripper_index = gripper_index
         self.remapper = JointMapper({}, len(motor_chain))  # so it works without gripper
         self._gripper_limits = gripper_limits
+        self._limit_gripper_force = limit_gripper_force
 
         if self._gripper_index is not None:
             self._gripper_force_limiter = GripperForceLimiter(
                 max_force=limit_gripper_force, gripper_type=gripper_type, kp=kp[gripper_index]
             )  # force in newton
-            self._limit_gripper_force = limit_gripper_force
 
             self.remapper = JointMapper(
                 index_range_map={gripper_index: gripper_limits},
