@@ -185,9 +185,11 @@ def get_yam_robot(
         receive_mode=ReceiveMode.p16,
         start_thread=False,
     )
-    motor_states = motor_chain.read_states()
-    print(f"motor_states: {motor_states}")
-    motor_chain.close()
+    try:
+        motor_states = motor_chain.read_states()
+        print(f"motor_states: {motor_states}")
+    finally:
+        motor_chain.close()
 
     logging.info(f"current_pos: {[m.pos for m in motor_states]}")
     for idx, state in enumerate(motor_states):
@@ -228,15 +230,19 @@ def get_yam_robot(
         set_realtime_and_pin_callback=set_realtime_and_pin_callback,
     )
 
-    if with_gripper:
-        return get_robot(
-            gripper_index=6,
-            gripper_limits=gripper_limits,
-            enable_gripper_calibration=gripper_needs_cal,
-            gripper_type=gripper_type,
-            limit_gripper_force=50.0,
-        )
-    return get_robot()
+    try:
+        if with_gripper:
+            return get_robot(
+                gripper_index=6,
+                gripper_limits=gripper_limits,
+                enable_gripper_calibration=gripper_needs_cal,
+                gripper_type=gripper_type,
+                limit_gripper_force=50.0,
+            )
+        return get_robot()
+    except BaseException:
+        motor_chain.close()
+        raise
 
 
 if __name__ == "__main__":

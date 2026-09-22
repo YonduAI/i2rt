@@ -151,31 +151,20 @@ class DMSingleMotorCanInterface(CanInterface):
         Args:
             motor_id (int): The ID of the motor to turn on.
         """
-        current_level = logging.getLogger().getEffectiveLevel()
-        logging.getLogger().setLevel(logging.ERROR)
-
-        id = motor_id  # self._get_frame_id(motor_id)
-        data = [0xFF] * 7 + [0xFC]
-
-        message = self._send_message_get_response(id, motor_id, data)
-
-        # dummy motor type just check motor status
-        motor_info = self.parse_recv_message(message, MotorType.DM4310, ignore_error=True)
-        if int(motor_info.error_code, 16) != MotorErrorCode.normal:
-            while int(motor_info.error_code, 16) != MotorErrorCode.normal:
-                logging.info(f"motor {motor_id} error: {motor_info.error_message}")
-                self.clean_error(motor_id=motor_id)
+        # Recover a disabled/watchdog state, but never clear electrical faults
+        # indefinitely while other joints are already enabled.
+        for attempt in range(3):
+            message = self._send_message_get_response(motor_id, motor_id, [0xFF] * 7 + [0xFC])
+            info = self.parse_recv_message(message, motor_type, ignore_error=True)
+            code = int(info.error_code, 16)
+            if code == MotorErrorCode.normal:
+                return info
+            if code not in (MotorErrorCode.disabled, MotorErrorCode.loss_communication):
+                raise RuntimeError(f"Motor {motor_id} refused enable: {info.error_message}")
+            if code == MotorErrorCode.loss_communication:
+                self.clean_error(motor_id)
                 self.try_receive_message()
-                logging.info(f"motor {motor_id} error cleaned")
-                # enable again
-
-                message = self._send_message_get_response(id, motor_id, data)
-                motor_info = self.parse_recv_message(message, motor_type, ignore_error=True)
-        else:
-            logging.info(f"motor {motor_id} is already on")
-        logging.getLogger().setLevel(current_level)
-        motor_info = self.parse_recv_message(message, motor_type)
-        return motor_info
+        raise RuntimeError(f"Motor {motor_id} failed to enable after 3 attempts: {info.error_message}")
 
     def clean_error(self, motor_id: int) -> None:
         # self.try_receive_message()
@@ -201,7 +190,19 @@ class DMSingleMotorCanInterface(CanInterface):
         """
         id = self._get_frame_id(motor_id)
         data = [0xFF] * 7 + [0xFD]
-        message = self._send_message_get_response(id, motor_id, data)
+        for _ in range(3):
+            message = self._send_message_get_response(id, motor_id, data)
+            code = message.data[0] >> 4
+            if code == MotorErrorCode.disabled:
+                return
+            if code != MotorErrorCode.loss_communication:
+                break
+            # A latched communication watchdog can persist after disable.
+            # Clear only that state, then confirm disable without enabling.
+            self.clean_error(motor_id)
+            for _ in range(3):
+                self.try_receive_message(timeout=.003)
+        raise RuntimeError(f"Motor {motor_id} disable was not confirmed: {message.data.hex()}")
 
     def save_zero_position(self, motor_id: int) -> None:
         """Save the current position as zero position.
@@ -423,17 +424,20 @@ class DMChainCanInterface(MotorChain):
             ])
 
         self.absolute_positions = None
-        self._motor_on()
-        starting_command = []
-        for motor_state in self.state:
-            starting_command.append(MotorCmd(torque=motor_state.torque))
-        logging.info(f"Initializing motorchain with starting command: {starting_command}")
-        self.commands = starting_command
-        self.command_lock = threading.Lock()
-
-        self.start_thread_flag = start_thread
-        if start_thread:
-            self.start_thread()
+        self.running = False
+        self._closed = False
+        self._close_error = None
+        self._thread = None
+        try:
+            self._motor_on()
+            self.commands = [MotorCmd(torque=state.torque) for state in self.state]
+            self.command_lock = threading.Lock()
+            self.start_thread_flag = start_thread
+            if start_thread:
+                self.start_thread()
+        except BaseException:
+            self.close()
+            raise
 
     def __repr__(self) -> str:
         return f"DMChainCanInterface(channel={self.channel})"
@@ -497,12 +501,18 @@ class DMChainCanInterface(MotorChain):
     def start_thread(self) -> None:
         # clean error again for motor with timeout enabled
         self._motor_on()
-        thread = threading.Thread(target=self._set_torques_and_update_state)
-        thread.start()
+        self._thread = threading.Thread(target=self._control_loop)
+        self._thread.start()
         time.sleep(0.1)
         while self.state is None:
             time.sleep(0.1)
             logging.info("waiting for the first state")
+
+    def _control_loop(self) -> None:
+        try:
+            self._set_torques_and_update_state()
+        finally:
+            self.close()
 
     def _set_torques_and_update_state(self) -> None:
         """
@@ -643,7 +653,28 @@ class DMChainCanInterface(MotorChain):
             return self.same_bus_device_states
 
     def close(self) -> None:
+        if self._closed:
+            if self._thread is not None and self._thread is not threading.current_thread():
+                self._thread.join()
+            if getattr(self, '_close_error', None):
+                raise RuntimeError(self._close_error)
+            return
+        self._closed = True
         self.running = False
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join()
+        errors = []
+        try:
+            for motor_id, _ in self.motor_list:
+                try:
+                    self.motor_interface.motor_off(motor_id)
+                except Exception as exc:
+                    errors.append(f"{motor_id}: {exc}")
+        finally:
+            self.motor_interface.close()
+        if errors:
+            self._close_error = "Motor disable failed: " + "; ".join(errors)
+            raise RuntimeError(self._close_error)
 
 
 class MultiDMChainCanInterface(MotorChain):
