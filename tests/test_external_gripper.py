@@ -103,3 +103,49 @@ def test_watchdog_shutdown_clears_latch_without_reenabling():
     motor.motor_off(1)
     motor.clean_error.assert_called_once_with(1)
     assert all(call.args[2] == [255]*7+[253] for call in motor._send_message_get_response.call_args_list)
+
+
+def test_watchdog_clear_consumes_its_reply_before_enabling():
+    """Three unpaired clear commands leave disabled replies ahead of enable."""
+    from collections import deque
+    import can
+    from i2rt.motor_drivers.utils import ReceiveMode
+
+    replies, commands = deque(), []
+    state = 13  # communication watchdog
+
+    def send(message):
+        nonlocal state
+        command = message.data[-1]
+        commands.append(command)
+        if command == 0xFB:
+            state = 0
+        elif command == 0xFC and state != 13:
+            state = 1
+        elif command == 0xFD and state != 13:
+            state = 0
+        replies.append(can.Message(arbitration_id=0x11, data=[state << 4 | 1] + [0]*7))
+
+    motor = object.__new__(dm_driver.DMSingleMotorCanInterface)
+    motor.bus = SimpleNamespace(send=send, recv=lambda **_: replies.popleft() if replies else None,
+                                channel_info='simulated yam_left')
+    motor.use_buffered_reader = False
+    motor.receive_mode = ReceiveMode.p16
+    motor.cmd_idoffset = 0
+    motor.name = 'simulated'
+    assert motor.motor_on(1, 'DM4340').error_code == '0x1'
+    assert commands == [0xFC, 0xFB, 0xFC]
+    assert not replies
+    motor.motor_off(1)
+    assert state == 0 and not replies
+
+
+def test_disable_retries_a_delayed_enabled_reply():
+    motor = object.__new__(dm_driver.DMSingleMotorCanInterface)
+    motor.cmd_idoffset = 0
+    motor._send_message_get_response = Mock(side_effect=[SimpleNamespace(data=bytes([0x11]*8)),
+                                                        SimpleNamespace(data=bytes([0x01]*8))])
+    motor.clean_error = Mock()
+    motor.motor_off(1)
+    assert motor._send_message_get_response.call_count == 2
+    motor.clean_error.assert_not_called()

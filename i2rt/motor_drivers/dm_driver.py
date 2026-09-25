@@ -163,24 +163,13 @@ class DMSingleMotorCanInterface(CanInterface):
                 raise RuntimeError(f"Motor {motor_id} refused enable: {info.error_message}")
             if code == MotorErrorCode.loss_communication:
                 self.clean_error(motor_id)
-                self.try_receive_message()
         raise RuntimeError(f"Motor {motor_id} failed to enable after 3 attempts: {info.error_message}")
 
     def clean_error(self, motor_id: int) -> None:
-        # self.try_receive_message()
-        id = motor_id  # self._get_frame_id(motor_id)
-        data = [0xFF] * 7 + [0xFB]
+        # Pair clear with its reply. Multiple fire-and-forget clears leave
+        # disabled feedback queued ahead of the next enable/disable response.
         logging.info("clear error")
-        message = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False)
-        for _ in range(3):
-            try:
-                self.bus.send(message)
-            except Exception as e:
-                logging.warning(e)
-                logging.warning(
-                    "\033[91m" + "CAN Error: Failed to communicate with motor over can bus. Retrying..." + "\033[0m"
-                )
-        # message = self._send_message_get_response(id, data)
+        self._send_message_get_response(motor_id, motor_id, [0xFF] * 7 + [0xFB])
 
     def motor_off(self, motor_id: int) -> None:
         """Turn off the motor.
@@ -195,13 +184,15 @@ class DMSingleMotorCanInterface(CanInterface):
             code = message.data[0] >> 4
             if code == MotorErrorCode.disabled:
                 return
+            if code == MotorErrorCode.normal:
+                # An in-flight enabled reply is not confirmation of disable.
+                # Retry within the existing bound, then fail if still enabled.
+                continue
             if code != MotorErrorCode.loss_communication:
                 break
             # A latched communication watchdog can persist after disable.
             # Clear only that state, then confirm disable without enabling.
             self.clean_error(motor_id)
-            for _ in range(3):
-                self.try_receive_message(timeout=.003)
         raise RuntimeError(f"Motor {motor_id} disable was not confirmed: {message.data.hex()}")
 
     def save_zero_position(self, motor_id: int) -> None:
