@@ -436,7 +436,10 @@ class DMChainCanInterface(MotorChain):
             if start_thread:
                 self.start_thread()
         except BaseException:
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                logging.exception("Motor cleanup also failed after startup failure")
             raise
 
     def __repr__(self) -> str:

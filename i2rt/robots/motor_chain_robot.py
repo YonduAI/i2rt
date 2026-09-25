@@ -574,16 +574,31 @@ class MotorChainRobot(Robot):
         self.close()
 
     def move_joints(self, target_joint_positions: np.ndarray, time_interval_s: float = 2.0) -> None:
-        """Move the robot to a given joint positions."""
+        """Move at 100 Hz with zero endpoint velocity and acceleration."""
+        duration = float(time_interval_s)
+        target = np.asarray(target_joint_positions, dtype=float)
+        if not np.isfinite(duration) or duration <= 0 or not np.all(np.isfinite(target)):
+            raise ValueError("Joint move requires finite positions and a positive duration")
         with self._state_lock:
-            current_pos = self._joint_state.pos
-        assert len(current_pos) == len(target_joint_positions)
-        steps = 50  # 50 steps over time_interval_s
+            current_pos = self._joint_state.pos.copy()
+        if target.shape != current_pos.shape:
+            raise ValueError("Joint target shape must match the robot")
+        steps = max(1, int(np.ceil(duration * 100)))
+        step_dt = duration / steps
+        next_tick = time.monotonic()
         for i in range(steps + 1):
-            alpha = i / steps  # Interpolation factor
-            target_pos = (1 - alpha) * current_pos + alpha * target_joint_positions  # Linear interpolation
+            u = i / steps
+            alpha = u**3 * (10 + u * (-15 + 6 * u))
+            target_pos = current_pos + alpha * (target - current_pos)
             self.command_joint_pos(target_pos)
-            time.sleep(time_interval_s / steps)
+            if i < steps:
+                next_tick += step_dt
+                delay = next_tick - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    # Stretch a delayed trajectory instead of bursting commands.
+                    next_tick = time.monotonic()
 
     def close(self) -> None:
         """Safely close the robot by setting all torques to zero."""
