@@ -300,7 +300,8 @@ class DMSingleMotorCanInterface(CanInterface):
                     f"motor id: {motor_id_of_this_response}, error: {error_message} at {self.name} and channel {self.bus.channel_info}"
                 )
                 raise RuntimeError(
-                    f"Motor error detected: motor id: {motor_id_of_this_response}, error: {error_message}"
+                    f"Motor error detected: motor id: {motor_id_of_this_response}, error: {error_message}; "
+                    f"MOS={data[6]} C, rotor={data[7]} C"
                 )
         p_int = (data[1] << 8) | data[2]
         v_int = (data[3] << 4) | (data[4] >> 4)
@@ -565,6 +566,7 @@ class DMChainCanInterface(MotorChain):
                     time.sleep(0.0005)  # this is necessary, else the locks will not be released
                     rate_recorder.track()
                 except Exception as e:
+                    self.fault_error = str(e)
                     print(f"DM Error in control loop: {e}")
                     self.running = False
                     raise e

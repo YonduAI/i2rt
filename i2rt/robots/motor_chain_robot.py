@@ -27,6 +27,7 @@ class JointStates:
     temp_mos: np.ndarray  # MOS temperature (float): Motor MOS temperature.
     temp_rotor: np.ndarray  # ROTOR temperature (float): Motor ROTOR temperature.
     timestamp: float
+    gravity_torque: Optional[np.ndarray] = None
 
     def asdict(self) -> Dict[str, Any]:
         return {
@@ -354,13 +355,14 @@ class MotorChainRobot(Robot):
                 )
                 self.motor_chain.start_thread()
                 self.motor_chain.start_thread_flag = True
-            self._update_joint_state(motor_torques, joint_commands)
+            self._update_joint_state(motor_torques, joint_commands, gravity_torque=g * self.gravity_comp_factor)
 
     def _update_joint_state(
         self,
         motor_torques: np.ndarray,
         joint_commands: "JointCommands",
         encoder_infos: Optional[List[PassiveEncoderInfo]] = None,
+        gravity_torque: Optional[np.ndarray] = None,
     ) -> None:
         """Send commands to motor chain, update joint state, and optionally save to disk."""
         if (
@@ -382,7 +384,11 @@ class MotorChainRobot(Robot):
             kp=joint_commands.kp,
             kd=joint_commands.kd,
         )
-        self._joint_state = self._motor_state_to_joint_state(motor_state)
+        state = self._motor_state_to_joint_state(motor_state)
+        # Publish together so telemetry can reuse this calculation without
+        # touching the controller's mutable MuJoCo data or doing another solve.
+        state.gravity_torque = None if gravity_torque is None else gravity_torque.copy()
+        self._joint_state = state
 
         # For SWE-454: keep monitoring qpos during runtime
         self._check_current_qpos_in_joint_limits()
