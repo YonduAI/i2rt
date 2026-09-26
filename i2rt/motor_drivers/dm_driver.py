@@ -33,6 +33,10 @@ CONTROL_PERIOD = 1.0 / CONTROL_FREQ  # 4 ms
 
 EXPECTED_CONTROL_PERIOD = 0.007
 REPORT_INTERVAL = 30.0
+STARTUP_FAULT_RESET_MAX_C = 50.0
+# Status 2 is undocumented on this firmware, but was observed to latch across
+# startup attempts and clear to disabled. Reset once; never treat it as normal.
+STARTUP_RESETTABLE_FAULTS = {0x2, *range(0x8, 0xF)}
 
 
 class ControlMode:
@@ -151,19 +155,62 @@ class DMSingleMotorCanInterface(CanInterface):
         Args:
             motor_id (int): The ID of the motor to turn on.
         """
-        # Recover a disabled/watchdog state, but never clear electrical faults
-        # indefinitely while other joints are already enabled.
+        # One reset per enable attempt, only with fresh, cool feedback. Hardware
+        # protections stay enabled; a fault that persists or returns aborts.
+        fault_recovered = False
         for attempt in range(3):
             message = self._send_message_get_response(motor_id, motor_id, [0xFF] * 7 + [0xFC])
             info = self.parse_recv_message(message, motor_type, ignore_error=True)
             code = int(info.error_code, 16)
             if code == MotorErrorCode.normal:
                 return info
-            if code not in (MotorErrorCode.disabled, MotorErrorCode.loss_communication):
-                raise RuntimeError(f"Motor {motor_id} refused enable: {info.error_message}")
-            if code == MotorErrorCode.loss_communication:
-                self.clean_error(motor_id)
+            if code in STARTUP_RESETTABLE_FAULTS and not fault_recovered and attempt < 2:
+                fault_recovered = self.recover_startup_fault(motor_id, motor_type)
+                if fault_recovered:
+                    continue
+            if code != MotorErrorCode.disabled:
+                raise RuntimeError(
+                    f"Motor {motor_id} refused enable: {info.error_message}; "
+                    f"MOS={getattr(info, 'temperature_mos', '?')} C, "
+                    f"rotor={getattr(info, 'temperature_rotor', '?')} C"
+                )
         raise RuntimeError(f"Motor {motor_id} failed to enable after 3 attempts: {info.error_message}")
+
+    def read_motor_status(self, motor_id: int, motor_type: str) -> FeedbackFrameInfo:
+        """Read feedback without enabling the motor or commanding torque."""
+        message = self._send_message_get_response(
+            0x7FF, motor_id, [motor_id & 0xFF, motor_id >> 8, 0xCC, 0, 0, 0, 0, 0]
+        )
+        return self.parse_recv_message(message, motor_type, ignore_error=True)
+
+    def recover_startup_fault(self, motor_id: int, motor_type: str) -> bool:
+        """Attempt one fault reset while disabled; never enable or send torque."""
+        for _ in range(2):
+            info = self.read_motor_status(motor_id, motor_type)
+            if int(info.error_code, 16) not in STARTUP_RESETTABLE_FAULTS:
+                return False
+            temperatures = (info.temperature_mos, info.temperature_rotor)
+            if not all(np.isfinite(t) and 0 < t <= STARTUP_FAULT_RESET_MAX_C for t in temperatures):
+                logging.warning(
+                    "Motor %s startup fault reset blocked: MOS=%s C, rotor=%s C; "
+                    "both must be valid and <= %s C", motor_id, *temperatures, STARTUP_FAULT_RESET_MAX_C
+                )
+                return False
+        logging.warning(
+            "Motor %s resetting startup latch %s (%s) once: MOS=%s C, rotor=%s C",
+            motor_id, info.error_code, info.error_message, *temperatures,
+        )
+        # Disable before reset; a fault may remain in the reply until cleared.
+        self._send_message_get_response(self._get_frame_id(motor_id), motor_id, [0xFF] * 7 + [0xFD])
+        self.clean_error(motor_id)
+        message = self._send_message_get_response(self._get_frame_id(motor_id), motor_id, [0xFF] * 7 + [0xFD])
+        if message.data[0] >> 4 != MotorErrorCode.disabled:
+            raise RuntimeError(f"Motor {motor_id} startup fault reset: disable was not confirmed: {message.data.hex()}")
+        confirmed = self.read_motor_status(motor_id, motor_type)
+        if int(confirmed.error_code, 16) != MotorErrorCode.disabled:
+            raise RuntimeError(f"Motor {motor_id} startup fault reset failed: {confirmed.error_message}")
+        logging.info("Motor %s startup latch cleared; disabled confirmed before enable retry", motor_id)
+        return True
 
     def clean_error(self, motor_id: int) -> None:
         # Pair clear with its reply. Multiple fire-and-forget clears leave
