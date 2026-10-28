@@ -22,7 +22,7 @@ from i2rt.robots.utils import (
 
 # ---------------------------------------------------------------------------
 # Per-arm joint limits (rad) — match XML joint ranges exactly.
-# A 0.15 rad safety buffer is added at runtime before passing to MotorChainRobot.
+# Defaults retain 0.15 rad encoder padding; explicit command limits are exact.
 # ---------------------------------------------------------------------------
 _ARM_JOINT_LIMITS: dict[ArmType, np.ndarray] = {
     ArmType.YAM: np.array(
@@ -110,6 +110,7 @@ def get_yam_robot(
     joint_state_saver_factory: Optional[Callable[[], Any]] = None,
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
     external_gripper: bool = False,
+    joint_limits: Optional[np.ndarray] = None,
 ) -> "MotorChainRobot":
     """Create a YAM-family robot (real or sim).
 
@@ -123,6 +124,8 @@ def get_yam_robot(
         sim: If True, return a SimRobot instead of connecting to real hardware.
         external_gripper: Control only the six arm motors; retain the selected
             gripper's inertial model for a separate gripper controller.
+        joint_limits: Optional (6, 2) arm command limits in radians, applied
+            exactly without the default encoder-offset padding.
     """
     with_gripper = not external_gripper and gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
     with_teaching_handle = gripper_type == GripperType.YAM_TEACHING_HANDLE
@@ -133,9 +136,17 @@ def get_yam_robot(
     # arm dynamics. Passive finger joints stay at their model default pose.
     model_path = combine_arm_and_gripper_xml(arm_type.get_xml_path(), gripper_type.get_xml_path(), ee_mass, ee_inertia)
 
-    joint_limits = _ARM_JOINT_LIMITS[arm_type].copy()
-    joint_limits[:, 0] -= 0.15  # safety buffer
-    joint_limits[:, 1] += 0.15
+    if joint_limits is None:
+        joint_limits = _ARM_JOINT_LIMITS[arm_type].copy()
+        joint_limits[:, 0] -= 0.15  # encoder-offset tolerance for default limits
+        joint_limits[:, 1] += 0.15
+    else:
+        joint_limits = np.array(joint_limits, dtype=float, copy=True)
+        if (
+            joint_limits.shape != (6, 2) or not np.all(np.isfinite(joint_limits))
+            or np.any(joint_limits[:, 0] >= joint_limits[:, 1])
+        ):
+            raise ValueError("joint_limits must be six finite increasing [lower, upper] pairs")
 
     # Build mutable lists from the frozen arm config, then extend for gripper.
     motor_list = [[can_id, mtype] for can_id, mtype in hw.motor_list]
