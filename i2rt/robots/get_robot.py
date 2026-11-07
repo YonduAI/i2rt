@@ -111,6 +111,10 @@ def get_yam_robot(
     set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
     external_gripper: bool = False,
     joint_limits: Optional[np.ndarray] = None,
+    joint_kp: Optional[np.ndarray] = None,
+    gravity_comp_factor: Optional[float] = None,
+    stream_velocity_feedforward: bool = False,
+    joint_kd: Optional[np.ndarray] = None,
 ) -> "MotorChainRobot":
     """Create a YAM-family robot (real or sim).
 
@@ -126,11 +130,30 @@ def get_yam_robot(
             gripper's inertial model for a separate gripper controller.
         joint_limits: Optional (6, 2) arm command limits in radians, applied
             exactly without the default encoder-offset padding.
+        joint_kp: Optional six arm position gains; gripper gains remain separate.
+        joint_kd: Optional six arm damping gains, within the motor protocol's (0, 5] range.
+        gravity_comp_factor: Override the arm variant's gravity feedforward scale.
+        stream_velocity_feedforward: Estimate bounded arm velocity from streaming positions.
     """
     with_gripper = not external_gripper and gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
     with_teaching_handle = gripper_type == GripperType.YAM_TEACHING_HANDLE
 
     hw = _ARM_HW_CONFIGS[arm_type]
+    if not isinstance(stream_velocity_feedforward, bool):
+        raise ValueError('stream_velocity_feedforward must be a boolean')
+    gravity_comp_factor = hw.gravity_comp_factor if gravity_comp_factor is None else float(gravity_comp_factor)
+    if not np.isfinite(gravity_comp_factor) or gravity_comp_factor <= 0:
+        raise ValueError('gravity_comp_factor must be finite and positive')
+    if joint_kp is not None:
+        joint_kp = np.array(joint_kp, dtype=float, copy=True)
+        if (joint_kp.shape != (6,) or not np.all(np.isfinite(joint_kp))
+                or np.any(joint_kp <= 0) or np.any(joint_kp > 500)):
+            raise ValueError('joint_kp must contain six finite gains in (0, 500]')
+    if joint_kd is not None:
+        joint_kd = np.array(joint_kd, dtype=float, copy=True)
+        if (joint_kd.shape != (6,) or not np.all(np.isfinite(joint_kd))
+                or np.any(joint_kd <= 0) or np.any(joint_kd > 5)):
+            raise ValueError('joint_kd must contain six finite gains in (0, 5]')
 
     # An external controller owns the gripper motor, but its mass remains in the
     # arm dynamics. Passive finger joints stay at their model default pose.
@@ -151,8 +174,10 @@ def get_yam_robot(
     # Build mutable lists from the frozen arm config, then extend for gripper.
     motor_list = [[can_id, mtype] for can_id, mtype in hw.motor_list]
     directions = list(hw.directions)
-    kp = hw.kp.copy()
-    kd = hw.kd.copy()
+    kp = hw.kp.copy() if joint_kp is None else joint_kp
+    kd = hw.kd.copy() if joint_kd is None else joint_kd
+    logging.info('YAM %s arm kp=%s kd=%s gravity_factor=%s', channel, kp, kd, gravity_comp_factor)
+    logging.info('YAM %s stream_velocity_feedforward=%s', channel, stream_velocity_feedforward)
     motor_offsets = [0.0] * len(motor_list)
 
     if with_gripper:
@@ -232,7 +257,8 @@ def get_yam_robot(
         motor_chain=motor_chain,
         xml_path=model_path,
         use_gravity_comp=True,
-        gravity_comp_factor=hw.gravity_comp_factor,
+        gravity_comp_factor=gravity_comp_factor,
+        stream_velocity_feedforward=stream_velocity_feedforward,
         joint_limits=joint_limits,
         kp=kp,
         kd=kd,

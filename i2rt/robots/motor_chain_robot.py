@@ -89,6 +89,7 @@ class MotorChainRobot(Robot):
         pinned_cpu: int | None = None,
         joint_state_saver_factory: Optional[Callable[[], Any]] = None,
         set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
+        stream_velocity_feedforward: bool = False,
     ) -> None:
         # Set up CPU pinning and real-time scheduling if requested
         if pinned_cpu is not None and set_realtime_and_pin_callback is not None:
@@ -97,6 +98,11 @@ class MotorChainRobot(Robot):
         self._joint_state_saver_factory = joint_state_saver_factory
         self._set_realtime_and_pin_callback = set_realtime_and_pin_callback
         self.temp_record_flag = temp_record_flag
+        self._stream_velocity_feedforward = stream_velocity_feedforward
+        self._position_command_time = None
+        self._position_command = None
+        self._position_velocity = np.zeros(len(motor_chain))
+        self._stream_velocity_time_constant = .06
         if gripper_index is not None:
             assert gripper_index == len(motor_chain) - 1, (
                 "Gripper index should be the last one, but got {gripper_index}"
@@ -314,6 +320,11 @@ class MotorChainRobot(Robot):
         """
         with self._command_lock:
             joint_commands = copy.deepcopy(self._commands)
+            stamp = self._position_command_time
+            if stamp is not None and time.monotonic() - stamp > .05:
+                # A stopped publisher must hold position, never retain velocity feedforward.
+                joint_commands.vel[:] = 0.
+            # Positions already passed IK collision checks; extrapolation can cross that margin.
         with self._state_lock:
             g = self._compute_gravity_compensation(self._joint_state)
             motor_torques = joint_commands.torques + g * self.gravity_comp_factor
@@ -519,6 +530,21 @@ class MotorChainRobot(Robot):
             self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)
             self._commands.kp = self._kp
             self._commands.kd = self._kd
+            if self._stream_velocity_feedforward:
+                now = time.monotonic()
+                dt = None if self._position_command_time is None else now - self._position_command_time
+                if dt is not None and .001 <= dt <= .05:
+                    # Filter only feedforward; retain the exact commanded position and timing.
+                    velocity = np.clip((pos - self._position_command) / dt, -5., 5.)
+                    alpha = 1. - np.exp(-dt / self._stream_velocity_time_constant)
+                    self._position_velocity += alpha * (velocity - self._position_velocity)
+                else:
+                    self._position_velocity[:] = 0.
+                if self._gripper_index is not None:
+                    self._position_velocity[self._gripper_index] = 0.
+                # Full compensation amplifies roughness in recorded controller motion.
+                self._commands.vel = .5 * self.remapper.to_robot_joint_vel_space(self._position_velocity.copy())
+                self._position_command, self._position_command_time = pos.copy(), now
 
     def command_joint_state(self, joint_state: Dict[str, np.ndarray]) -> None:
         """Command the leader robot to a given state.
@@ -528,10 +554,12 @@ class MotorChainRobot(Robot):
         """
         pos = self._clip_robot_joint_pos_command(joint_state["pos"])
         vel = joint_state["vel"]
-        self._commands = JointCommands.init_all_zero(len(self.motor_chain))
         kp = joint_state.get("kp", self._kp)
         kd = joint_state.get("kd", self._kd)
         with self._command_lock:
+            self._position_command_time = None
+            self._position_velocity[:] = 0.
+            self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)
             self._commands.vel = self.remapper.to_robot_joint_vel_space(vel)
             self._commands.kp = kp

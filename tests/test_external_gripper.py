@@ -11,7 +11,9 @@ from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
 from i2rt.motor_drivers import dm_driver
 
 
-def test_external_gripper_preserves_payload_and_owns_only_arm_motors(monkeypatch):
+@pytest.mark.parametrize('joint_kp', [None, [240., 240., 240., 120., 30., 30.]])
+@pytest.mark.parametrize('joint_kd', [None, [4., 5., 4.5, 1.25, 1., 1.5]])
+def test_external_gripper_preserves_payload_and_owns_only_arm_motors(monkeypatch, joint_kp, joint_kd):
     chain = Mock()
     chain.read_states.return_value = [SimpleNamespace(pos=0.) for _ in range(6)]
     factory = Mock(return_value=chain)
@@ -19,12 +21,18 @@ def test_external_gripper_preserves_payload_and_owns_only_arm_motors(monkeypatch
     monkeypatch.setattr(get_robot, 'DMChainCanInterface', factory)
     monkeypatch.setattr(get_robot, 'MotorChainRobot', robot)
     monkeypatch.setattr(get_robot.time, 'sleep', lambda _: None)
-    get_robot.get_yam_robot(channel='yam_left', external_gripper=True)
+    get_robot.get_yam_robot(channel='yam_left', external_gripper=True, joint_kp=joint_kp, joint_kd=joint_kd,
+                          gravity_comp_factor=None if joint_kp is None else 1.,
+                          stream_velocity_feedforward=joint_kp is not None)
     for call in factory.call_args_list:
         assert [entry[0] for entry in call.args[0]] == [1, 2, 3, 4, 5, 6]
     args = robot.call_args.kwargs
     assert 'gripper_index' not in args
     assert len(args['kp']) == len(args['kd']) == 6
+    np.testing.assert_array_equal(args['kp'], [80., 80., 80., 40., 10., 10.] if joint_kp is None else joint_kp)
+    np.testing.assert_array_equal(args['kd'], [5., 5., 5., 1.5, 1.5, 1.5] if joint_kd is None else joint_kd)
+    assert args['gravity_comp_factor'] == (1.3 if joint_kp is None else 1.)
+    assert args['stream_velocity_feedforward'] == (joint_kp is not None)
     loaded = mujoco.MjModel.from_xml_path(args['xml_path'])
     bare = mujoco.MjModel.from_xml_path(combine_arm_and_gripper_xml(
         ArmType.YAM.get_xml_path(), GripperType.NO_GRIPPER.get_xml_path()))
@@ -32,6 +40,33 @@ def test_external_gripper_preserves_payload_and_owns_only_arm_motors(monkeypatch
     data = mujoco.MjData(loaded)
     mujoco.mj_inverse(loaded, data)
     assert np.all(np.isfinite(data.qfrc_inverse[:6]))
+
+
+@pytest.mark.parametrize('gains', [[80.]*5, [80.]*7, [float('nan')]*6, [501.]*6, [0.]*6])
+def test_invalid_position_gains_never_open_can(monkeypatch, gains):
+    factory = Mock()
+    monkeypatch.setattr(get_robot, 'DMChainCanInterface', factory)
+    with pytest.raises(ValueError, match='joint_kp'):
+        get_robot.get_yam_robot(joint_kp=gains)
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize('gains', [[1.]*5, [1.]*7, [float('nan')]*6, [5.01]*6, [0.]*6])
+def test_invalid_damping_never_opens_can(monkeypatch, gains):
+    factory = Mock()
+    monkeypatch.setattr(get_robot, 'DMChainCanInterface', factory)
+    with pytest.raises(ValueError, match='joint_kd'):
+        get_robot.get_yam_robot(joint_kd=gains)
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize('scale', [float('nan'), float('inf'), 0., -1.])
+def test_invalid_gravity_scale_never_opens_can(monkeypatch, scale):
+    factory = Mock()
+    monkeypatch.setattr(get_robot, 'DMChainCanInterface', factory)
+    with pytest.raises(ValueError, match='gravity_comp_factor'):
+        get_robot.get_yam_robot(gravity_comp_factor=scale)
+    factory.assert_not_called()
 
 
 def test_arm_socket_filters_out_external_gripper_feedback(monkeypatch):

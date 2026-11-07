@@ -8,6 +8,64 @@ import numpy as np
 from i2rt.robots import motor_chain_robot
 
 
+def test_stream_feedforward_preserves_position_and_expires_without_new_commands(monkeypatch):
+    now = [0.]
+    monkeypatch.setattr(motor_chain_robot.time, 'monotonic', lambda: now[0])
+    robot = object.__new__(motor_chain_robot.MotorChainRobot)
+    robot.motor_chain = Mock()
+    robot.motor_chain.__len__ = Mock(return_value=7)
+    robot._command_lock = threading.Lock()
+    robot._state_lock = threading.Lock()
+    robot._stream_velocity_feedforward = True
+    robot._position_command_time = robot._position_command = None
+    robot._position_velocity = np.zeros(7)
+    robot._stream_velocity_time_constant = .06
+    robot._gripper_index = 6
+    robot._gripper_limits = np.array([0., 1.])
+    robot._joint_limits = None
+    robot._limit_gripper_force = -1
+    robot._kp, robot._kd = np.ones(7)*80, np.ones(7)*5
+    robot.remapper = motor_chain_robot.JointMapper({}, 7)
+    robot._joint_state = None
+    robot._clip_motor_torque = 28.
+    robot.gravity_comp_factor = 1.
+    robot._compute_gravity_compensation = lambda _: np.zeros(7)
+    robot._update_joint_state = Mock()
+    robot.command_joint_pos(np.zeros(7))
+    np.testing.assert_array_equal(robot._commands.vel, np.zeros(7))
+    for n in range(1, 101):
+        now[0] = n/100
+        robot.command_joint_pos(np.full(7, now[0]))
+    np.testing.assert_allclose(robot._commands.pos, 1.)
+    np.testing.assert_allclose(robot._commands.vel[:6], .5, atol=1e-6)
+    assert robot._commands.vel[-1] == 0.
+    now[0] += .005
+    robot.update()
+    sent = robot._update_joint_state.call_args.args[1]
+    np.testing.assert_array_equal(sent.pos, np.ones(7))
+    np.testing.assert_allclose(sent.vel[:6], .5, atol=1e-6)
+    assert sent.pos[6] == 1.
+    np.testing.assert_array_equal(robot._commands.pos, np.ones(7))
+    now[0] += .01
+    robot.command_joint_pos(np.full(7, 20.))
+    assert np.max(np.abs(robot._commands.vel)) <= 2.5
+    now[0] += .051
+    robot.update()
+    np.testing.assert_array_equal(robot._update_joint_state.call_args.args[1].vel, np.zeros(7))
+    np.testing.assert_array_equal(robot._update_joint_state.call_args.args[1].pos[:6], np.full(6,20.))
+    robot.command_joint_pos(np.full(7, .6))
+    np.testing.assert_array_equal(robot._commands.vel, np.zeros(7))
+    now[0] += .01
+    robot.command_joint_pos(np.full(7, .61))
+    assert robot._commands.vel[0] > 0
+    robot.command_joint_state({'pos': np.full(7, .61), 'vel': np.full(7, .2)})
+    assert robot._position_command_time is None
+    np.testing.assert_allclose(robot._commands.vel, .2)
+    robot._stream_velocity_feedforward = False
+    robot.command_joint_pos(np.full(7, .7))
+    np.testing.assert_array_equal(robot._commands.vel, np.zeros(7))
+
+
 def test_joint_move_is_dense_smooth_and_uses_deadlines(monkeypatch):
     now = [0.]
     monkeypatch.setattr(motor_chain_robot.time, 'monotonic', lambda: now[0])
