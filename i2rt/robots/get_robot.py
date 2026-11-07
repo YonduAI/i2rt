@@ -115,6 +115,7 @@ def get_yam_robot(
     gravity_comp_factor: Optional[float] = None,
     stream_velocity_feedforward: bool = False,
     joint_kd: Optional[np.ndarray] = None,
+    model_xml_path: Optional[str] = None,
 ) -> "MotorChainRobot":
     """Create a YAM-family robot (real or sim).
 
@@ -134,6 +135,7 @@ def get_yam_robot(
         joint_kd: Optional six arm damping gains, within the motor protocol's (0, 5] range.
         gravity_comp_factor: Override the arm variant's gravity feedforward scale.
         stream_velocity_feedforward: Estimate bounded arm velocity from streaming positions.
+        model_xml_path: Complete six-joint arm/payload model for an external gripper.
     """
     with_gripper = not external_gripper and gripper_type not in (GripperType.YAM_TEACHING_HANDLE, GripperType.NO_GRIPPER)
     with_teaching_handle = gripper_type == GripperType.YAM_TEACHING_HANDLE
@@ -157,7 +159,17 @@ def get_yam_robot(
 
     # An external controller owns the gripper motor, but its mass remains in the
     # arm dynamics. Passive finger joints stay at their model default pose.
-    model_path = combine_arm_and_gripper_xml(arm_type.get_xml_path(), gripper_type.get_xml_path(), ee_mass, ee_inertia)
+    if model_xml_path is None:
+        model_path = combine_arm_and_gripper_xml(arm_type.get_xml_path(), gripper_type.get_xml_path(), ee_mass, ee_inertia)
+    else:
+        import mujoco
+        if not external_gripper or ee_mass is not None or ee_inertia is not None:
+            raise ValueError('model_xml_path requires an external gripper and includes its payload inertia')
+        model = mujoco.MjModel.from_xml_path(model_xml_path)
+        if model.nq != 6 or model.nv != 6 or np.any(model.body_gravcomp):
+            raise ValueError('model_xml_path must have six scalar joints and no body gravcomp')
+        model_path = model_xml_path
+    logging.info('YAM %s dynamics model: %s', channel, model_path)
 
     if joint_limits is None:
         joint_limits = _ARM_JOINT_LIMITS[arm_type].copy()

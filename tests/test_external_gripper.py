@@ -11,6 +11,35 @@ from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
 from i2rt.motor_drivers import dm_driver
 
 
+def test_invalid_complete_model_never_opens_can(monkeypatch, tmp_path):
+    factory = Mock()
+    monkeypatch.setattr(get_robot, 'DMChainCanInterface', factory)
+    path = tmp_path / 'invalid.xml'
+    path.write_text('<mujoco/>')
+    with pytest.raises(ValueError, match='six scalar joints'):
+        get_robot.get_yam_robot(external_gripper=True, model_xml_path=str(path))
+    with pytest.raises(ValueError, match='external gripper'):
+        get_robot.get_yam_robot(model_xml_path=str(path))
+    factory.assert_not_called()
+
+
+def test_complete_model_used_for_gravity_without_recombining(monkeypatch, tmp_path):
+    chain = Mock()
+    chain.read_states.return_value = [SimpleNamespace(pos=0.) for _ in range(6)]
+    monkeypatch.setattr(get_robot, 'DMChainCanInterface', Mock(return_value=chain))
+    robot = Mock()
+    monkeypatch.setattr(get_robot, 'MotorChainRobot', robot)
+    monkeypatch.setattr(get_robot.time, 'sleep', lambda _: None)
+    combine = Mock(side_effect=AssertionError('must use supplied model'))
+    monkeypatch.setattr(get_robot, 'combine_arm_and_gripper_xml', combine)
+    path = tmp_path / 'arm.xml'
+    bodies = ''.join(f'<body pos="0 0 .1"><joint name="j{i}"/><geom size=".01"/>' for i in range(6))
+    path.write_text('<mujoco><worldbody>' + bodies + '</body>' * 6 + '</worldbody></mujoco>')
+    get_robot.get_yam_robot(external_gripper=True, model_xml_path=str(path))
+    assert robot.call_args.kwargs['xml_path'] == str(path)
+    combine.assert_not_called()
+
+
 @pytest.mark.parametrize('joint_kp', [None, [240., 240., 240., 120., 30., 30.]])
 @pytest.mark.parametrize('joint_kd', [None, [4., 5., 4.5, 1.25, 1., 1.5]])
 def test_external_gripper_preserves_payload_and_owns_only_arm_motors(monkeypatch, joint_kp, joint_kd):
