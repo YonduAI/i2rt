@@ -47,16 +47,20 @@ class CanInterface:
             can.Message: The message that was sent.
         """
         message = can.Message(arbitration_id=id, data=data, is_extended_id=False)
+        if expected_id is None:
+            expected_id = self.receive_mode.get_receive_id(motor_id)
         for _ in range(max_retry):
             try:
                 self.bus.send(message)
-                response = self._receive_message(motor_id, timeout=0.2)
-
-                if expected_id is None:
-                    expected_id = self.receive_mode.get_receive_id(motor_id)
-                if response and (expected_id == response.arbitration_id):
-                    return response
-                self.try_receive_message(id)
+                deadline = time.monotonic() + 0.2
+                while (remaining := deadline - time.monotonic()) > 0:
+                    response = self._receive_message(motor_id, timeout=remaining)
+                    if response is None:
+                        break
+                    if expected_id == response.arbitration_id:
+                        return response
+                    # Shared-bus gripper traffic is not a failed arm transaction.
+                    # Keep waiting; flushing another frame can discard the reply.
             except (can.CanError, AssertionError) as e:
                 logging.warning(e)
                 logging.warning(
