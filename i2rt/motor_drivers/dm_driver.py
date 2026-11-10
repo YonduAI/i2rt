@@ -596,12 +596,14 @@ class DMChainCanInterface(MotorChain):
 
                     # Update state
                     with self.command_lock:
-                        motor_feedback = self._set_commands(self.commands)
-                        errors = np.array([motor_feedback[i].error_code != "0x1" for i in range(len(motor_feedback))])
-                        if np.any(errors):
-                            self.running = False
-                            logging.error(f"motor errors: {errors}")
-                            raise Exception("motors have errors, stopping control loop")
+                        commands = list(self.commands)
+                    # Never block newer goals/holds behind a CAN transaction.
+                    motor_feedback = self._set_commands(commands)
+                    errors = np.array([motor_feedback[i].error_code != "0x1" for i in range(len(motor_feedback))])
+                    if np.any(errors):
+                        self.running = False
+                        logging.error(f"motor errors: {errors}")
+                        raise Exception("motors have errors, stopping control loop")
 
                     with self.state_lock:
                         self.state = motor_feedback
