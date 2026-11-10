@@ -59,7 +59,10 @@ def test_stream_feedforward_preserves_position_and_expires_without_new_commands(
     robot.command_joint_pos(np.full(7, .61))
     assert robot._commands.vel[0] > 0
     robot.command_joint_state({'pos': np.full(7, .61), 'vel': np.full(7, .2)})
-    assert robot._position_command_time is None
+    assert robot._position_command_time == now[0]
+    now[0] += .051
+    robot.update()
+    np.testing.assert_array_equal(robot._update_joint_state.call_args.args[1].vel, np.zeros(7))
     np.testing.assert_allclose(robot._commands.vel, .2)
     robot._stream_velocity_feedforward = False
     robot.command_joint_pos(np.full(7, .7))

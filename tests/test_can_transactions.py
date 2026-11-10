@@ -10,7 +10,8 @@ from i2rt.motor_drivers.utils import ReceiveMode
 
 
 @pytest.mark.parametrize('expected_id', [None, 0, 0x31])
-def test_other_motor_traffic_does_not_discard_expected_reply(expected_id):
+@pytest.mark.parametrize('noise', ['gripper', 'error', 'remote', 'extended'])
+def test_other_motor_traffic_does_not_discard_expected_reply(expected_id, noise):
     interface = object.__new__(CanInterface)
     interface.name = 'arm'
     interface.receive_mode = ReceiveMode.p16
@@ -22,7 +23,13 @@ def test_other_motor_traffic_does_not_discard_expected_reply(expected_id):
 
     def send(_):
         # A separate gripper owner can transmit just before this arm's reply.
-        frames.extend([can.Message(arbitration_id=7, data=[0]*8, is_extended_id=False), reply])
+        if noise == 'gripper':
+            unwanted = can.Message(arbitration_id=7, data=[0]*8, is_extended_id=False)
+        else:
+            unwanted = can.Message(arbitration_id=reply.arbitration_id, data=[1]*8,
+                                    is_error_frame=noise == 'error', is_remote_frame=noise == 'remote',
+                                    is_extended_id=noise == 'extended')
+        frames.extend([unwanted, reply])
 
     interface.bus.send.side_effect = send
     interface.bus.recv.side_effect = lambda **_: frames.popleft() if frames else None

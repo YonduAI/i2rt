@@ -57,6 +57,12 @@ class CanInterface:
                     response = self._receive_message(motor_id, timeout=remaining)
                     if response is None:
                         break
+                    if response.is_error_frame:
+                        logging.warning('CAN controller error on %s: class=0x%x data=%s',
+                                        self.bus.channel_info, response.arbitration_id, response.data.hex())
+                        continue
+                    if response.is_remote_frame or response.is_extended_id:
+                        continue
                     if expected_id == response.arbitration_id:
                         return response
                     # Shared-bus gripper traffic is not a failed arm transaction.

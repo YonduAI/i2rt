@@ -11,6 +11,38 @@ from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
 from i2rt.motor_drivers import dm_driver
 
 
+def test_applied_command_trace_only_advances_after_a_complete_can_cycle():
+    chain = object.__new__(dm_driver.DMChainCanInterface)
+    chain.channel = 'FAKE'
+    chain.motor_list = [(1, 'DM4310'), (2, 'DM4310')]
+    chain.motor_offset, chain.motor_direction = np.zeros(2), np.ones(2)
+    chain.motor_interface = Mock()
+    commands = [dm_driver.MotorCmd(pos=.1, vel=.2, torque=0., kp=20., kd=1.) for _ in range(2)]
+    chain.last_applied_command = None
+    chain._set_commands(commands)
+    completed = chain.last_applied_command
+    assert completed['position_targets_rad'] == [.1, .1]
+    assert completed['velocity_targets_rad_s'] == [.2, .2]
+    chain.motor_interface.set_control.side_effect = [Mock(), TimeoutError('lost motor reply')]
+    with pytest.raises(TimeoutError):
+        chain._set_commands(commands)
+    assert chain.last_applied_command is completed
+
+
+def test_reading_cached_states_does_not_make_stalled_can_feedback_fresh():
+    import threading
+    chain = object.__new__(dm_driver.DMChainCanInterface)
+    chain.motor_list = [(1, 'DM4310')]
+    chain.motor_direction, chain.motor_offset, chain.absolute_positions = np.ones(1), np.zeros(1), np.array([.2])
+    chain.state_lock = threading.Lock()
+    chain.state = [SimpleNamespace(id=1, error_code='0x1', velocity=0., torque=0.,
+                                   temperature_rotor=30., temperature_mos=31.)]
+    chain.last_applied_command = {'timestamp_ns': 1_000_000_000}
+    first, second = chain.read_states(), chain.read_states()
+    assert first[0].timestamp == second[0].timestamp == 1.
+    assert first[0].pos == .2
+
+
 def test_invalid_complete_model_never_opens_can(monkeypatch, tmp_path):
     factory = Mock()
     monkeypatch.setattr(get_robot, 'DMChainCanInterface', factory)
@@ -188,7 +220,8 @@ def test_watchdog_clear_consumes_its_reply_before_enabling():
             state = 1
         elif command == 0xFD and state != 13:
             state = 0
-        replies.append(can.Message(arbitration_id=0x11, data=[state << 4 | 1] + [0]*5 + [31, 30]))
+        replies.append(can.Message(arbitration_id=0x11, is_extended_id=False,
+                                   data=[state << 4 | 1] + [0]*5 + [31, 30]))
 
     motor = object.__new__(dm_driver.DMSingleMotorCanInterface)
     motor.bus = SimpleNamespace(send=send, recv=lambda **_: replies.popleft() if replies else None,
@@ -237,7 +270,7 @@ def test_startup_fault_reset_consumes_replies_and_recovers_only_once(fault, clea
             state = enable_to
         elif command == 0xFD and state == 1:
             state = 0
-        replies.append(can.Message(arbitration_id=0x12,
+        replies.append(can.Message(arbitration_id=0x12, is_extended_id=False,
                                    data=[state << 4 | 2, 0x80, 0, 0x80, 0x08, 0, 31, 30]))
 
     motor = object.__new__(dm_driver.DMSingleMotorCanInterface)

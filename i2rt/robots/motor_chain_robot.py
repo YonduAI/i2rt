@@ -557,7 +557,8 @@ class MotorChainRobot(Robot):
         kp = joint_state.get("kp", self._kp)
         kd = joint_state.get("kd", self._kd)
         with self._command_lock:
-            self._position_command_time = None
+            self._position_command_time = time.monotonic()
+            self._position_command = pos.copy()
             self._position_velocity[:] = 0.
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
             self._commands.pos = self.remapper.to_robot_joint_pos_space(pos)

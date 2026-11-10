@@ -467,6 +467,7 @@ class DMChainCanInterface(MotorChain):
         self._closed = False
         self._close_error = None
         self._thread = None
+        self.last_applied_command = None
         try:
             self._motor_on()
             self.commands = [MotorCmd(torque=state.torque) for state in self.state]
@@ -643,11 +644,18 @@ class DMChainCanInterface(MotorChain):
                 raise e
 
             motor_feedback.append(fd_back)
+        # Publish only a completed CAN cycle, never a target waiting behind a stalled reply.
+        self.last_applied_command = {
+            'timestamp_ns': time.time_ns(), 'timestamp_monotonic_ns': time.monotonic_ns(),
+            'position_targets_rad': [cmd.pos for cmd in commands],
+            'velocity_targets_rad_s': [cmd.vel for cmd in commands],
+        }
         return motor_feedback
 
     def read_states(self, torques: Optional[np.ndarray] = None) -> List[MotorInfo]:
         motor_infos = []
-        timestamp = time.time()
+        applied = self.last_applied_command
+        timestamp = time.time() if applied is None else applied['timestamp_ns'] / 1e9
         with self.state_lock:
             for idx in range(len(self.motor_list)):
                 state = self.state[idx]
