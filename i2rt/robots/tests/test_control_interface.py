@@ -17,7 +17,8 @@ GRIPPER_COMBOS = [
     (GripperType.LINEAR_4310, "grasp_site"),
     (GripperType.LINEAR_3507, "grasp_site"),
     (GripperType.NO_GRIPPER, "grasp_site"),
-    (GripperType.YAM_TEACHING_HANDLE, "tcp_site"),
+    (GripperType.YAM_TEACHING_HANDLE_V1, "tcp_site"),
+    (GripperType.YAM_TEACHING_HANDLE_V2, "tcp_site"),
 ]
 
 
@@ -37,7 +38,7 @@ def _make_iface(gripper: GripperType, site: str) -> tuple[SimRobot, MujocoContro
 @pytest.mark.parametrize("gripper,site", GRIPPER_COMBOS, ids=_combo_id)
 def test_vis_mode_mirror(gripper: GripperType, site: str) -> None:
     """VIS mode: mirror_robot should set qpos and forward without error."""
-    _robot, iface = _make_iface(gripper, site)
+    _, iface = _make_iface(gripper, site)
     iface._mirror_robot()
     iface._sync_mocap_to_ee()
 
@@ -64,7 +65,7 @@ def test_control_mode_ik_dimensions(gripper: GripperType, site: str) -> None:
 
     target = iface._mocap_pose_4x4()
     init_q = iface._data.qpos[: iface._nq].copy()
-    _ok, ik_q = iface._kin.ik(target, site, init_q=init_q, max_iters=10)
+    _, ik_q = iface._kin.ik(target, site, init_q=init_q, max_iters=10)
 
     assert ik_q.shape[0] == iface._nq
     cmd = robot.get_joint_pos().copy()
@@ -97,6 +98,18 @@ def test_control_mode_preserves_gripper(gripper: GripperType, site: str) -> None
     cmd[: iface._n_arm] = ik_q[: iface._n_arm]
     assert cmd[robot._gripper_index] == pytest.approx(gripper_val, abs=1e-6)
     robot.command_joint_pos(cmd)
+
+
+@pytest.mark.parametrize("gripper,site", GRIPPER_COMBOS, ids=_combo_id)
+def test_sync_mocap_to_sliders(gripper: GripperType, site: str) -> None:
+    """_sync_mocap_to_sliders should work even when nq > num_dofs (coupled joints)."""
+    _, iface = _make_iface(gripper, site)
+    iface._mirror_robot()
+    iface._sync_sliders_to_robot()
+    # This used to crash with ValueError for linear grippers (nq=8, num_dofs=7)
+    iface._sync_mocap_to_sliders()
+    pos = iface._data.mocap_pos[iface._mocap_id]
+    assert np.all(np.isfinite(pos))
 
 
 @pytest.mark.parametrize("gripper,site", GRIPPER_COMBOS, ids=_combo_id)

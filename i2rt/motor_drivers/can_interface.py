@@ -17,6 +17,7 @@ class CanInterface:
         receive_mode: ReceiveMode = ReceiveMode.p16,
         use_buffered_reader: bool = False,
     ):
+        self.channel = channel
         self.bus = can.interface.Bus(bustype=bustype, channel=channel, bitrate=bitrate)
         self.busstate = self.bus.state
         self.name = name
@@ -58,8 +59,12 @@ class CanInterface:
                     if response is None:
                         break
                     if response.is_error_frame:
-                        logging.warning('CAN controller error on %s: class=0x%x data=%s',
-                                        self.bus.channel_info, response.arbitration_id, response.data.hex())
+                        logging.warning(
+                            "CAN controller error on %s: class=0x%x data=%s",
+                            self.bus.channel_info,
+                            response.arbitration_id,
+                            response.data.hex(),
+                        )
                         continue
                     if response.is_remote_frame or response.is_extended_id:
                         continue
@@ -93,6 +98,26 @@ class CanInterface:
         except AssertionError:
             return None
 
+    def _drain_bus(self, timeout_s: float = 0.05, idle_count: int = 10) -> int:
+        """Drain pending CAN frames until the bus is idle.
+
+        Loops `try_receive_message(timeout=0.001)` until either `idle_count`
+        consecutive 1 ms reads return None or `timeout_s` wall-clock has
+        elapsed. Used at init handovers (e.g. between encoder validation and
+        motor bring-up) to flush stale frames that would otherwise be misread
+        as the next motor's reply. Returns the number of frames consumed.
+        """
+        drained = 0
+        idle = 0
+        deadline = time.time() + timeout_s
+        while time.time() < deadline and idle < idle_count:
+            if self.try_receive_message(timeout=0.001) is None:
+                idle += 1
+            else:
+                idle = 0
+                drained += 1
+        return drained
+
     def _receive_message(
         self, motor_id: Optional[int] = None, timeout: float = 0.009, supress_warning: bool = False
     ) -> Optional[can.Message]:
@@ -110,16 +135,11 @@ class CanInterface:
         start_time = time.time()
         while (time.time() - start_time) < timeout:
             if self.use_buffered_reader:
-                # Use BufferedReader to get the message
-                message = self.buffered_reader.get_message(timeout=0.002)
+                message = self.buffered_reader.get_message(timeout=0.001)
             else:
-                message = self.bus.recv(timeout=0.002)
+                message = self.bus.recv(timeout=0.001)
             if message:
                 return message
-            else:
-                message = self.bus.recv(timeout=0.0008)
-                if message:
-                    return message
         if not supress_warning:
             logging.warning(
                 "\033[91m"

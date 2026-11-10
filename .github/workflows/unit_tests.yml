@@ -2,7 +2,7 @@ name: unit_tests_CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
   schedule:
     - cron: "0 0 * * 0"
@@ -16,10 +16,11 @@ jobs:
       - name: Install Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: |
-          pip install uv
-          uv pip install --system -e ".[dev]"
+          uv sync --dev
       - name: Test with pytest
-        run: pytest -n auto
+        run: uv run pytest -n auto
