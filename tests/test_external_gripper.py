@@ -121,13 +121,28 @@ def test_invalid_damping_never_opens_can(monkeypatch, gains):
     factory.assert_not_called()
 
 
-@pytest.mark.parametrize('scale', [float('nan'), float('inf'), 0., -1.])
+@pytest.mark.parametrize('scale', [float('nan'), float('inf'), 0., -1., [1.]*5, [1.]*7,
+                                  [[1.]*6], [1., 1., 1., 1., 1., float('nan')], [0.]*6])
 def test_invalid_gravity_scale_never_opens_can(monkeypatch, scale):
     factory = Mock()
     monkeypatch.setattr(get_robot, 'DMChainCanInterface', factory)
     with pytest.raises(ValueError, match='gravity_comp_factor'):
         get_robot.get_yam_robot(gravity_comp_factor=scale)
     factory.assert_not_called()
+
+
+@pytest.mark.parametrize('external', [False, True])
+def test_per_joint_gravity_factors_preserve_arm_order_and_gripper(monkeypatch, external):
+    chain = Mock()
+    chain.read_states.return_value = [SimpleNamespace(pos=0.) for _ in range(6 if external else 7)]
+    monkeypatch.setattr(get_robot, 'DMChainCanInterface', Mock(return_value=chain))
+    robot = Mock()
+    monkeypatch.setattr(get_robot, 'MotorChainRobot', robot)
+    monkeypatch.setattr(get_robot.time, 'sleep', lambda _: None)
+    factors = [1., 1.2, 1., 1.1, 1., 1.]
+    get_robot.get_yam_robot(external_gripper=external, gravity_comp_factor=factors)
+    np.testing.assert_array_equal(robot.call_args.kwargs['gravity_comp_factor'],
+                                  factors if external else factors+[1.])
 
 
 def test_arm_socket_filters_out_external_gripper_feedback(monkeypatch):

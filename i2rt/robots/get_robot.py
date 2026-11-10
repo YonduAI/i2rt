@@ -112,7 +112,7 @@ def get_yam_robot(
     external_gripper: bool = False,
     joint_limits: Optional[np.ndarray] = None,
     joint_kp: Optional[np.ndarray] = None,
-    gravity_comp_factor: Optional[float] = None,
+    gravity_comp_factor: Optional[float | np.ndarray] = None,
     stream_velocity_feedforward: bool = False,
     joint_kd: Optional[np.ndarray] = None,
     model_xml_path: Optional[str] = None,
@@ -133,7 +133,7 @@ def get_yam_robot(
             exactly without the default encoder-offset padding.
         joint_kp: Optional six arm position gains; gripper gains remain separate.
         joint_kd: Optional six arm damping gains, within the motor protocol's (0, 5] range.
-        gravity_comp_factor: Override the arm variant's gravity feedforward scale.
+        gravity_comp_factor: Positive scalar or six arm gravity feedforward scales.
         stream_velocity_feedforward: Estimate bounded arm velocity from streaming positions.
         model_xml_path: Complete six-joint arm/payload model for an external gripper.
     """
@@ -143,9 +143,13 @@ def get_yam_robot(
     hw = _ARM_HW_CONFIGS[arm_type]
     if not isinstance(stream_velocity_feedforward, bool):
         raise ValueError('stream_velocity_feedforward must be a boolean')
-    gravity_comp_factor = hw.gravity_comp_factor if gravity_comp_factor is None else float(gravity_comp_factor)
-    if not np.isfinite(gravity_comp_factor) or gravity_comp_factor <= 0:
-        raise ValueError('gravity_comp_factor must be finite and positive')
+    gravity_comp_factor = np.array(hw.gravity_comp_factor if gravity_comp_factor is None else gravity_comp_factor,
+                                  dtype=float, copy=True)
+    if (gravity_comp_factor.shape not in ((), (6,)) or not np.all(np.isfinite(gravity_comp_factor))
+            or np.any(gravity_comp_factor <= 0)):
+        raise ValueError('gravity_comp_factor must be a finite positive scalar or six arm factors')
+    if gravity_comp_factor.ndim == 0:
+        gravity_comp_factor = float(gravity_comp_factor)
     if joint_kp is not None:
         joint_kp = np.array(joint_kp, dtype=float, copy=True)
         if (joint_kp.shape != (6,) or not np.all(np.isfinite(joint_kp))
@@ -201,6 +205,8 @@ def get_yam_robot(
         directions.append(1)
         kp = np.append(kp, gripper_kp)
         kd = np.append(kd, gripper_kd)
+        if isinstance(gravity_comp_factor, np.ndarray):
+            gravity_comp_factor = np.append(gravity_comp_factor, 1.)
 
     gripper_limits = gripper_type.get_gripper_limits() if with_gripper else None
     gripper_needs_cal = gripper_type.get_gripper_needs_calibration() if with_gripper else False
