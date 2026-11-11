@@ -1,4 +1,4 @@
-"""A motion batch must expire on its original clock, without replaying old setpoints."""
+"""Recover one lost reply without extending a motion batch's original deadline."""
 
 from types import SimpleNamespace
 from typing import Any
@@ -69,13 +69,13 @@ def test_receive_uses_one_blocking_wait_instead_of_one_ms_polling(monkeypatch: p
 
 
 @pytest.mark.parametrize("expired", [False, True])
-def test_stream_deadline_prevents_retries_and_expired_transmission(
+def test_stream_deadline_bounds_retry_and_prevents_expired_transmission(
     monkeypatch: pytest.MonkeyPatch, expired: bool
 ) -> None:
     obj, clock, bus = interface(monkeypatch, [])
     with pytest.raises(TimeoutError, match="deadline"):
         obj._send_message_get_response(1, 1, [0] * 8, max_retry=15, deadline=10.0 if expired else 10.01)
-    assert len(bus.sent) == (0 if expired else 1)
+    assert len(bus.sent) == (0 if expired else 2)
     assert clock.now <= 10.01 + 1e-10
 
 
@@ -87,14 +87,14 @@ def test_reply_delivered_after_deadline_is_not_accepted(monkeypatch: pytest.Monk
 
 
 def test_unrelated_frames_do_not_resend_or_renew_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    obj, clock, bus = interface(monkeypatch, [(0.004, reply(7)), (0.004, reply())])
+    obj, clock, bus = interface(monkeypatch, [(0.002, reply(7)), (0.002, reply())])
     assert obj._send_message_get_response(1, 1, [0] * 8, deadline=10.01).arbitration_id == 0x11
     assert len(bus.sent) == 1
-    assert bus.waits == pytest.approx([0.01, 0.006])
-    assert clock.now == pytest.approx(10.008)
+    assert bus.waits == pytest.approx([0.005, 0.003])
+    assert clock.now == pytest.approx(10.004)
 
 
-def test_stream_encoding_passes_deadline_without_retrying(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stream_encoding_passes_deadline_with_one_bounded_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, Any]] = []
     obj = object.__new__(DMSingleMotorCanInterface)
     obj.control_mode = ControlMode.MIT
@@ -102,7 +102,7 @@ def test_stream_encoding_passes_deadline_without_retrying(monkeypatch: pytest.Mo
     obj._send_message_get_response = lambda *args, **kw: calls.append(kw) or reply()
     obj.parse_recv_message = lambda *args: SimpleNamespace(error_code="0x1")
     obj.set_control(1, MotorType.DM4310, 0.0, 0.0, 0.0, 0.0, 0.0, deadline=10.02)
-    assert calls == [{"max_retry": 1, "deadline": 10.02}]
+    assert calls == [{"max_retry": 2, "deadline": 10.02}]
 
 
 def test_whole_chain_has_one_budget_and_never_advances_after_missing_reply(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -125,9 +125,66 @@ def test_whole_chain_has_one_budget_and_never_advances_after_missing_reply(monke
     commands = [MotorCmd(pos=0.0, vel=0.0, kp=0.0, kd=0.0, torque=0.0) for _ in range(6)]
     with pytest.raises(TimeoutError, match="motor 2"):
         chain._set_commands(commands)
-    assert [m.arbitration_id for m in bus.sent] == [1, 2]
+    assert [m.arbitration_id for m in bus.sent] == [1, 2, 2]
     assert clock.now == pytest.approx(10.01)
     assert chain.last_applied_command is None
+
+
+def test_lost_reply_recovers_same_target_without_enabling_or_extending_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    obj, clock, bus = interface(monkeypatch, [(0.005, None), (0.001, reply())])
+    payload = [0x7F, 0xFF, 0x7F, 0xF0, 0, 0, 7, 0xFF]
+    assert obj._send_message_get_response(1, 1, payload, deadline=10.04).arbitration_id == 0x11
+    assert [bytes(m.data) for m in bus.sent] == [bytes(payload)] * 2
+    assert clock.now == pytest.approx(10.006)
+    assert obj.last_transaction["attempts"] == 2
+
+
+@pytest.mark.parametrize("noise", ["stuff", "short", "stale"])
+def test_malformed_or_stale_reply_is_ignored_when_valid_reply_follows(
+    monkeypatch: pytest.MonkeyPatch, noise: str
+) -> None:
+    bad = reply()
+    if noise == "stuff":
+        # Exact first error notification captured on 1commerce at 22:45:10.010071.
+        bad = can.Message(
+            arbitration_id=0x8, is_error_frame=True, is_extended_id=False, data=bytes.fromhex("0000040000000001")
+        )
+    elif noise == "short":
+        bad.data = bytearray([0x11])
+        bad.dlc = 1
+    else:
+        bad.timestamp = 1009.9
+    obj, clock, bus = interface(monkeypatch, [(0.001, bad), (0.001, reply())])
+    received = obj._send_message_get_response(1, 1, [0] * 8, deadline=10.04)
+    assert received is not bad
+    assert clock.now == pytest.approx(10.002)
+    assert len(bus.sent) == 1
+
+
+def test_repeated_error_frames_do_not_renew_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    error = can.Message(arbitration_id=0x24, is_error_frame=True, data=bytes.fromhex("0020000000008000"))
+    obj, clock, bus = interface(monkeypatch, [(0.001, error)] * 100)
+    with pytest.raises(TimeoutError, match="deadline"):
+        obj._send_message_get_response(1, 1, [0] * 8, deadline=10.04)
+    assert clock.now <= 10.041 + 1e-10
+    assert len(bus.sent) == 2
+
+
+@pytest.mark.parametrize("status", [0x0, 0xB, 0xD])
+def test_disabled_thermal_and_watchdog_states_are_not_retried_or_ignored(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    fault = reply()
+    fault.data[0] = (status << 4) | 1
+    obj, _, bus = interface(monkeypatch, [(0.001, fault)])
+    obj.__class__ = DMSingleMotorCanInterface
+    obj.control_mode = ControlMode.MIT
+    obj.cmd_idoffset = 0
+    with pytest.raises(RuntimeError, match="Motor error detected"):
+        obj.set_control(1, MotorType.DM4310, 0.0, 0.0, 0.0, 0.0, 0.0, deadline=10.04)
+    assert len(bus.sent) == 1
 
 
 def test_can_cadence_matches_configured_frequency_without_catchup(monkeypatch: pytest.MonkeyPatch) -> None:

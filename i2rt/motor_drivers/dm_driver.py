@@ -354,7 +354,7 @@ class DMSingleMotorCanInterface(CanInterface):
             frame_id,
             motor_id,
             data,
-            **({"max_retry": 1, "deadline": deadline} if deadline is not None else {"max_retry": 15}),
+            **({"max_retry": 2, "deadline": deadline} if deadline is not None else {"max_retry": 15}),
         )
 
         # Parse the received message to extract motor information

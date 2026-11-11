@@ -57,18 +57,25 @@ class CanInterface:
         message = can.Message(arbitration_id=id, data=data, is_extended_id=False)
         if expected_id is None:
             expected_id = self.receive_mode.get_receive_id(motor_id)
-        for _ in range(max_retry):
+        # Motion may resend the same absolute target once after a lost reply.
+        # Both attempts share the original whole-chain deadline; never replay an
+        # expired batch or spend the full deadline before the only retry.
+        attempts = min(max_retry, 2) if deadline is not None else max_retry
+        send_time = time.monotonic_ns()
+        send_wall_time = time.time_ns()
+        for attempt in range(attempts):
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"CAN motion deadline expired before motor {motor_id} on {self.name}")
             try:
-                send_time = time.monotonic_ns()
-                send_wall_time = time.time_ns()
                 self.bus.send(message)
+                reply_timeout = 0.005 if deadline is not None and attempt == 0 and attempts > 1 else 0.2
                 reply_deadline = (
-                    min(deadline, time.monotonic() + 0.2) if deadline is not None else time.monotonic() + 0.2
+                    min(deadline, time.monotonic() + reply_timeout)
+                    if deadline is not None
+                    else time.monotonic() + reply_timeout
                 )
                 while (remaining := reply_deadline - time.monotonic()) > 0:
-                    response = self._receive_message(motor_id, timeout=remaining)
+                    response = self._receive_message(motor_id, timeout=remaining, supress_warning=deadline is not None)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise TimeoutError(f"CAN motion deadline expired waiting for motor {motor_id} on {self.name}")
                     if response is None:
@@ -84,8 +91,16 @@ class CanInterface:
                     if response.is_remote_frame or response.is_extended_id:
                         continue
                     if expected_id == response.arbitration_id:
+                        if deadline is not None and (
+                            len(response.data) != 8
+                            or response.dlc != 8
+                            or 0 < response.timestamp < send_wall_time / 1e9
+                        ):
+                            # A short or queued old reply cannot establish fresh motor state.
+                            continue
                         self.last_transaction = {
                             "motor_id": motor_id,
+                            "attempts": attempt + 1,
                             "send_monotonic_ns": send_time,
                             "send_timestamp_ns": send_wall_time,
                             "reply_timestamp_ns": int(response.timestamp * 1e9),
@@ -105,8 +120,10 @@ class CanInterface:
                     + "\033[0m"
                 )
             if deadline is not None:
-                raise TimeoutError(f"CAN motion deadline: no reply from motor {motor_id} on {self.name}")
-            time.sleep(0.001)
+                if attempt + 1 == attempts:
+                    raise TimeoutError(f"CAN motion deadline: no reply from motor {motor_id} on {self.name}")
+            else:
+                time.sleep(0.001)
         raise AssertionError(
             f"fail to communicate with the motor {id} on {self.name} at can channel {self.bus.channel_info}"
         )
