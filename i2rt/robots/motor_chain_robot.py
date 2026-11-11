@@ -824,7 +824,10 @@ class MotorChainRobot(Robot):
             self.motor_chain.close()
         finally:
             self.stop_mcap_recording()
-        print("Robot closed with all torques set to zero.")
+        if getattr(self.motor_chain, 'passive_fault', None) is not None:
+            print("Passive observer closed without commanding motor disable; torque unconfirmed.")
+        else:
+            print("Robot closed with all torques set to zero.")
 
     def update_kp_kd(self, kp: np.ndarray, kd: np.ndarray) -> None:
         assert kp.shape == self._kp.shape == kd.shape
