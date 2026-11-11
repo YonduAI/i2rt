@@ -64,8 +64,6 @@ class CanInterface:
         send_time = time.monotonic_ns()
         send_wall_time = time.time_ns()
         for attempt in range(attempts):
-            if getattr(self, "transmit_suspended", False):
-                raise RuntimeError("CAN transmission suspended for passive fault observation")
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"CAN motion deadline expired before motor {motor_id} on {self.name}")
             try:

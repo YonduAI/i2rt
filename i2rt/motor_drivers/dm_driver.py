@@ -565,11 +565,6 @@ class DMChainCanInterface(MotorChain):
         self._close_error = None
         self._thread = None
         self.last_applied_command = None
-        # Armed explicitly after guarded startup, only for supported bench diagnostics.
-        self.observe_faults = False
-        self.passive_fault = None
-        self.passive_feedback = {}
-        self._observation_stop = threading.Event()
         try:
             self._motor_on()
             self.commands = [MotorCmd(torque=state.torque) for state in self.state]
@@ -661,50 +656,8 @@ class DMChainCanInterface(MotorChain):
     def _control_loop(self) -> None:
         try:
             self._set_torques_and_update_state()
-        except Exception as exc:
-            if not getattr(self, "observe_faults", False):
-                raise
-            self.enter_passive_fault(str(exc))
         finally:
-            if getattr(self, "passive_fault", None) is None:
-                self.close()
-            else:
-                self._observe_without_transmitting()
-
-    def enter_passive_fault(self, reason: str) -> None:
-        """Latch diagnostic silence; never equate it with a hold or torque-off."""
-        if not self.observe_faults:
-            raise RuntimeError("Passive observation was not armed")
-        with self.command_lock:
-            if self.passive_fault is not None:
-                return
-            self.passive_fault = str(reason)
-            self.fault_error = str(reason)
-            self.motor_interface.transmit_suspended = True
-            self.running = False
-        logging.critical("%s PASSIVE FAULT: no further commands or disables; torque unconfirmed: %s", self, reason)
-
-    def _observe_without_transmitting(self) -> None:
-        """Receive late feedback only. Silence cannot establish bus recovery."""
-        kinds = {self.motor_interface.receive_mode.get_receive_id(mid): kind for mid, kind in self.motor_list}
-        while not self._observation_stop.is_set():
-            try:
-                message = self.motor_interface._receive_message(timeout=0.1, supress_warning=True)
-                if message is None:
-                    continue
-                logging.warning("Passive CAN RX id=0x%x error=%s data=%s", message.arbitration_id,
-                                message.is_error_frame, message.data.hex())
-                if (not message.is_error_frame and not message.is_extended_id and not message.is_remote_frame
-                        and len(message.data) == 8 and message.arbitration_id in kinds):
-                    feedback = self.motor_interface.parse_recv_message(message, kinds[message.arbitration_id],
-                                                                        ignore_error=True)
-                    self.passive_feedback = {**self.passive_feedback, str(feedback.id): {
-                        "timestamp_s": message.timestamp, "status": feedback.error_code,
-                        "position_rad": feedback.position, "mos_c": feedback.temperature_mos,
-                        "rotor_c": feedback.temperature_rotor}}
-            except Exception as exc:
-                logging.error("Passive CAN receive unavailable; no reset attempted: %s", exc)
-                self._observation_stop.wait(1.0)
+            self.close()
 
     def _set_torques_and_update_state(self) -> None:
         """
@@ -756,6 +709,7 @@ class DMChainCanInterface(MotorChain):
                             if self._try_recover_motors():
                                 logging.warning("Motor recovery successful, continuing control loop")
                                 continue
+                            self.running = False
                             raise
                         raise
 
@@ -766,6 +720,7 @@ class DMChainCanInterface(MotorChain):
                             if self._try_recover_motors(motor_feedback):
                                 logging.warning("Motor recovery successful, continuing control loop")
                                 continue
+                        self.running = False
                         logging.error(f"motor errors: {errors}")
                         raise Exception(f"motor errors detected: {errors}, stopping control loop")
 
@@ -782,14 +737,9 @@ class DMChainCanInterface(MotorChain):
                     time.sleep(max(0.0, cycle_started + self.control_period - time.monotonic()))
                     self._rate_recorder.track()
                 except Exception as e:
-                    # Publish the passive latch before running=False is visible
-                    # to parent cleanup, which would otherwise disable the arm.
-                    if getattr(self, "observe_faults", False):
-                        self.enter_passive_fault(str(e))
-                    else:
-                        self.fault_error = str(e)
-                        self.running = False
+                    self.fault_error = str(e)
                     print(f"DM Error in control loop: {e}")
+                    self.running = False
                     raise e
 
     def _try_recover_motors(self, motor_feedback: Optional[List[MotorInfo]] = None, max_retries: int = 3) -> bool:
@@ -931,8 +881,6 @@ class DMChainCanInterface(MotorChain):
                 )
             )
         with self.command_lock:
-            if getattr(self, "passive_fault", None) is not None:
-                return self.read_states(torques=torques) if get_state else None
             self.commands = command
         if get_state:
             return self.read_states(torques=torques)
@@ -950,13 +898,6 @@ class DMChainCanInterface(MotorChain):
             return
         self._closed = True
         self.running = False
-        if getattr(self, "passive_fault", None) is not None:
-            self._observation_stop.set()
-            if self._thread is not None and self._thread is not threading.current_thread():
-                self._thread.join()
-            self.motor_interface.close()
-            logging.critical("Passive observer closed WITHOUT motor disable; torque remains unconfirmed")
-            return
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join()
         errors = []
