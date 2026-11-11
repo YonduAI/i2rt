@@ -424,3 +424,54 @@ def test_startup_recovery_checks_a_second_fresh_sample_before_clearing() -> None
     assert not motor.recover_startup_fault(2, "DM4340")
     assert motor.read_motor_status.call_count == 2
     motor.clean_error.assert_not_called()
+
+
+def test_dynamics_compile_before_any_motor_is_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    prepared = object()
+    chain = Mock(motor_direction=np.ones(6), motor_offset=np.zeros(6))
+    chain.read_states.return_value = [SimpleNamespace(pos=0.0) for _ in range(6)]
+
+    def compile_model(path: str) -> object:
+        events.append("compile")
+        return prepared
+
+    def open_chain(*args: object, **kwargs: object) -> Mock:
+        assert events == ["compile"]
+        events.append("enable")
+        return chain
+
+    robot = Mock()
+    monkeypatch.setattr(get_robot, "MuJoCoKDL", compile_model)
+    monkeypatch.setattr(get_robot, "DMChainCanInterface", open_chain)
+    monkeypatch.setattr(get_robot, "MotorChainRobot", robot)
+    get_robot.get_yam_robot(arm_type=ArmType.BIG_YAM, external_gripper=True)
+    assert robot.call_args.kwargs["kinematics"] is prepared
+
+
+def test_failed_dynamics_compile_does_not_enable_motors(monkeypatch: pytest.MonkeyPatch) -> None:
+    factory = Mock()
+    monkeypatch.setattr(get_robot, "DMChainCanInterface", factory)
+    monkeypatch.setattr(get_robot, "MuJoCoKDL", Mock(side_effect=RuntimeError("invalid dynamics")))
+    with pytest.raises(RuntimeError, match="invalid dynamics"):
+        get_robot.get_yam_robot(arm_type=ArmType.BIG_YAM, external_gripper=True)
+    factory.assert_not_called()
+
+
+def test_robot_reuses_precompiled_dynamics_without_stalling_can(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import MagicMock
+
+    from i2rt.robots import motor_chain_robot
+
+    prepared = SimpleNamespace(joint_limits=np.tile([-3.0, 3.0], (6, 1)))
+    chain = MagicMock()
+    chain.__len__.return_value = 6
+    monkeypatch.setattr(motor_chain_robot, "MuJoCoKDL", Mock(side_effect=AssertionError("compiled after enable")))
+    monkeypatch.setattr(motor_chain_robot.threading, "Thread", Mock())
+    monkeypatch.setattr(
+        motor_chain_robot.MotorChainRobot,
+        "_motor_state_to_joint_state",
+        lambda *args: SimpleNamespace(pos=np.zeros(6)),
+    )
+    robot = motor_chain_robot.MotorChainRobot(chain, xml_path="precompiled.xml", kinematics=prepared)
+    assert robot.kdl is prepared

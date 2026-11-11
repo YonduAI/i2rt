@@ -21,6 +21,7 @@ from i2rt.robots.utils import (
     _load_arm_config,
     combine_arm_and_gripper_xml,
 )
+from i2rt.utils.mujoco_utils import MuJoCoKDL
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,7 @@ def get_yam_robot(
     stream_velocity_feedforward: bool = False,
     model_xml_path: Optional[str] = None,
     repair_motor_config: bool = True,
+    control_cycle_timeout: Optional[float] = None,
 ) -> "Robot":
     """Create a YAM-family robot (real or sim).
 
@@ -241,6 +243,7 @@ def get_yam_robot(
         stream_velocity_feedforward: Estimate bounded velocity from streaming positions.
         model_xml_path: Complete arm/payload model for an external gripper.
         repair_motor_config: Allow startup to repair CTRL_MODE; False reports mismatches without writing.
+        control_cycle_timeout: Monotonic time budget for a complete streaming CAN batch; no command retries.
     """
     # --- Gripper-only path (no arm) -------------------------------------------
     if arm_type == ArmType.NO_ARM:
@@ -368,6 +371,10 @@ def get_yam_robot(
 
     # --- Real hardware path ---------------------------------------------------
 
+    # Model compilation can hold the GIL for tens of milliseconds. Finish it
+    # before enabling motors, not beside the already-running CAN thread.
+    kinematics = MuJoCoKDL(model_path)
+
     # Single pass: create chain, read positions, fix wrap-around offsets in-place, then start thread.
     motor_chain = DMChainCanInterface(
         motor_list,
@@ -387,6 +394,7 @@ def get_yam_robot(
         # The arm config's motor_registers (e.g. KT_Value/GREF on a 7-DOF arm); arm motors only.
         expected_registers=hw.motor_registers,
         repair_motor_config=repair_motor_config,
+        control_cycle_timeout=control_cycle_timeout,
     )
     try:
         motor_states = motor_chain.read_states()
@@ -409,6 +417,7 @@ def get_yam_robot(
             MotorChainRobot,
             motor_chain=motor_chain,
             xml_path=model_path,
+            kinematics=kinematics,
             use_gravity_comp=True,
             gravity_comp_factor=effective_gravity_comp,
             stream_velocity_feedforward=stream_velocity_feedforward,

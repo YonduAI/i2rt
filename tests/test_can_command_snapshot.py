@@ -12,6 +12,7 @@ from i2rt.utils.utils import RateRecorder
 
 def test_publisher_replaces_goal_while_an_older_can_cycle_is_blocked() -> None:
     chain = object.__new__(DMChainCanInterface)
+    chain.control_period = 1 / 250
     chain.channel = "FAKE"
     chain.running = True
     chain.motor_list = [(1, "DM4310")]

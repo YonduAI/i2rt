@@ -296,6 +296,8 @@ class DMSingleMotorCanInterface(CanInterface):
         kp: float,
         kd: float,
         torque: float,
+        *,
+        deadline: Optional[float] = None,
     ) -> FeedbackFrameInfo:
         """Set the control of the motor and return its status.
 
@@ -348,7 +350,12 @@ class DMSingleMotorCanInterface(CanInterface):
             )
 
         # Send the CAN message
-        message = self._send_message_get_response(frame_id, motor_id, data, max_retry=15)
+        message = self._send_message_get_response(
+            frame_id,
+            motor_id,
+            data,
+            **({"max_retry": 1, "deadline": deadline} if deadline is not None else {"max_retry": 15}),
+        )
 
         # Parse the received message to extract motor information
         motor_info = self.parse_recv_message(message, motor_type)
@@ -461,11 +468,20 @@ class DMChainCanInterface(MotorChain):
         loop_critical_motor_ids: Optional[Sequence[int]] = None,  # motors whose feedback the caller's loop acts on
         expected_registers: Optional[Mapping[int, Mapping[str, float]]] = None,  # {can_id: {reg: value}}, config check
         repair_motor_config: bool = True,
+        control_cycle_timeout: Optional[float] = None,
     ):
         assert not use_buffered_reader, (
             "buffered reader is not very stable, the latest encoder fix allows us to use the non-buffered reader"
         )
         assert len(motor_list) > 0
+        if not np.isfinite(control_freq) or control_freq <= 0:
+            raise ValueError("control_freq must be finite and positive")
+        self.control_period = 1.0 / control_freq
+        if control_cycle_timeout is not None and (
+            not np.isfinite(control_cycle_timeout) or control_cycle_timeout < self.control_period
+        ):
+            raise ValueError("control_cycle_timeout must be finite and at least one control period")
+        self.control_cycle_timeout = control_cycle_timeout
         assert len(motor_list) == len(motor_offset) == len(motor_direction), (
             f"len{len(motor_list)}, len{len(motor_offset)}, len{len(motor_direction)}"
         )
@@ -657,6 +673,7 @@ class DMChainCanInterface(MotorChain):
         with self._rate_recorder:
             while self.running:
                 try:
+                    cycle_started = time.monotonic()
                     curr_time = time.time()
                     step_time = curr_time - last_step_time
                     last_step_time = curr_time
@@ -715,7 +732,9 @@ class DMChainCanInterface(MotorChain):
                         with self.same_bus_device_lock:
                             # assume the same bus device is a passive input device (no commands to send) for now.
                             self.same_bus_device_states = self.same_bus_device_driver.read_states()
-                    time.sleep(0.0005)  # yield GIL so other threads can acquire locks
+                    # Enforce the frequency used by the bandwidth check. A slow
+                    # cycle consumes its period; never send a catch-up burst.
+                    time.sleep(max(0.0, cycle_started + self.control_period - time.monotonic()))
                     self._rate_recorder.track()
                 except Exception as e:
                     self.fault_error = str(e)
@@ -769,6 +788,10 @@ class DMChainCanInterface(MotorChain):
 
     def _set_commands(self, commands: List[MotorCmd]) -> List[MotorInfo]:
         motor_feedback = []
+        cycle_started = time.monotonic()
+        timeout = getattr(self, "control_cycle_timeout", None)
+        deadline = None if timeout is None else cycle_started + timeout
+        transactions = []
         for idx, motor_info in enumerate(self.motor_list):
             motor_id, motor_type = motor_info
             torque = commands[idx].torque * self.motor_direction[idx]
@@ -786,18 +809,24 @@ class DMChainCanInterface(MotorChain):
                     kp=kp,
                     kd=kd,
                     torque=torque,
+                    **({"deadline": deadline} if deadline is not None else {}),
                 )
             except Exception as e:
                 logging.error(f"{idx}th motor at DMChainCanInterface {self} failed with info {motor_info}")
                 raise e
 
             motor_feedback.append(fd_back)
+            transaction = getattr(self.motor_interface, "last_transaction", None)
+            if isinstance(transaction, dict):
+                transactions.append(dict(transaction))
         # Publish only a completed CAN cycle, never a target waiting behind a stalled reply.
         self.last_applied_command = {
             "timestamp_ns": time.time_ns(),
             "timestamp_monotonic_ns": time.monotonic_ns(),
             "position_targets_rad": [cmd.pos for cmd in commands],
             "velocity_targets_rad_s": [cmd.vel for cmd in commands],
+            "can_transactions": transactions,
+            "cycle_started_monotonic_ns": int(cycle_started * 1e9),
         }
         return motor_feedback
 

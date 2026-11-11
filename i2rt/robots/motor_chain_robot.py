@@ -120,6 +120,7 @@ class MotorChainRobot(Robot):
         set_realtime_and_pin_callback: Optional[Callable[[int], None]] = None,
         enable_auto_recovery: Optional[bool] = None,  # None: inherit motor_chain's setting; True/False: override it
         stream_velocity_feedforward: bool = False,
+        kinematics: Optional[MuJoCoKDL] = None,
     ) -> None:
         # Set up CPU pinning and real-time scheduling if requested
         if pinned_cpu is not None and set_realtime_and_pin_callback is not None:
@@ -248,7 +249,7 @@ class MotorChainRobot(Robot):
         self._joint_limits: Optional[np.ndarray] = None
         if xml_path is not None:
             self.xml_path = os.path.expanduser(xml_path)
-            self.kdl = MuJoCoKDL(self.xml_path)
+            self.kdl = kinematics if kinematics is not None else MuJoCoKDL(self.xml_path)
             if gravity is not None:
                 self.kdl.set_gravity(gravity)
             # Load the joint limits from the xml file
