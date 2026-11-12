@@ -270,6 +270,8 @@ class DMSingleMotorCanInterface(CanInterface):
         kp: float,
         kd: float,
         torque: float,
+        *,
+        deadline: Optional[float] = None,
     ) -> FeedbackFrameInfo:
         """Set the control of the motor and return its status.
 
@@ -313,7 +315,10 @@ class DMSingleMotorCanInterface(CanInterface):
             data[0:4] = can_data[0:4]
 
         # Send the CAN message
-        message = self._send_message_get_response(frame_id, motor_id, data, max_retry=15)
+        message = self._send_message_get_response(
+            frame_id, motor_id, data,
+            **({"max_retry": 2, "deadline": deadline} if deadline is not None else {"max_retry": 15}),
+        )
 
         # Parse the received message to extract motor information
         motor_info = self.parse_recv_message(message, motor_type)

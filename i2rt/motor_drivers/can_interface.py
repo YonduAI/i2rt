@@ -17,6 +17,7 @@ class CanInterface:
         receive_mode: ReceiveMode = ReceiveMode.p16,
         use_buffered_reader: bool = False,
     ):
+        self.channel = channel
         self.bus = can.interface.Bus(bustype=bustype, channel=channel, bitrate=bitrate)
         self.busstate = self.bus.state
         self.name = name
@@ -35,7 +36,14 @@ class CanInterface:
         self.bus.shutdown()
 
     def _send_message_get_response(
-        self, id: int, motor_id: int, data: List[int], max_retry: int = 5, expected_id: Optional[int] = None
+        self,
+        id: int,
+        motor_id: int,
+        data: List[int],
+        max_retry: int = 5,
+        expected_id: Optional[int] = None,
+        *,
+        deadline: Optional[float] = None,
     ) -> can.Message:
         """Send a message over the CAN bus.
 
@@ -47,24 +55,75 @@ class CanInterface:
             can.Message: The message that was sent.
         """
         message = can.Message(arbitration_id=id, data=data, is_extended_id=False)
-        for _ in range(max_retry):
+        if expected_id is None:
+            expected_id = self.receive_mode.get_receive_id(motor_id)
+        # Motion may resend the same absolute target once after a lost reply.
+        # Both attempts share the original whole-chain deadline; never replay an
+        # expired batch or spend the full deadline before the only retry.
+        attempts = min(max_retry, 2) if deadline is not None else max_retry
+        send_time = time.monotonic_ns()
+        send_wall_time = time.time_ns()
+        for attempt in range(attempts):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"CAN motion deadline expired before motor {motor_id} on {self.name}")
             try:
                 self.bus.send(message)
-                response = self._receive_message(motor_id, timeout=0.2)
-
-                if expected_id is None:
-                    expected_id = self.receive_mode.get_receive_id(motor_id)
-                if response and (expected_id == response.arbitration_id):
-                    return response
-                self.try_receive_message(id)
+                reply_timeout = 0.005 if deadline is not None and attempt == 0 and attempts > 1 else 0.2
+                reply_deadline = (
+                    min(deadline, time.monotonic() + reply_timeout)
+                    if deadline is not None
+                    else time.monotonic() + reply_timeout
+                )
+                while (remaining := reply_deadline - time.monotonic()) > 0:
+                    response = self._receive_message(motor_id, timeout=remaining, supress_warning=deadline is not None)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError(f"CAN motion deadline expired waiting for motor {motor_id} on {self.name}")
+                    if response is None:
+                        break
+                    if response.is_error_frame:
+                        logging.warning(
+                            "CAN controller error on %s: class=0x%x data=%s",
+                            self.bus.channel_info,
+                            response.arbitration_id,
+                            response.data.hex(),
+                        )
+                        continue
+                    if response.is_remote_frame or response.is_extended_id:
+                        continue
+                    if expected_id == response.arbitration_id:
+                        if deadline is not None and (
+                            len(response.data) != 8
+                            or response.dlc != 8
+                            or 0 < response.timestamp < send_wall_time / 1e9
+                        ):
+                            # A short or queued old reply cannot establish fresh motor state.
+                            continue
+                        self.last_transaction = {
+                            "motor_id": motor_id,
+                            "attempts": attempt + 1,
+                            "send_monotonic_ns": send_time,
+                            "send_timestamp_ns": send_wall_time,
+                            "reply_timestamp_ns": int(response.timestamp * 1e9),
+                            "completed_monotonic_ns": time.monotonic_ns(),
+                            "completed_timestamp_ns": time.time_ns(),
+                        }
+                        return response
+                    # Shared-bus gripper traffic is not a failed arm transaction.
+                    # Keep waiting; flushing another frame can discard the reply.
             except (can.CanError, AssertionError) as e:
+                if deadline is not None:
+                    raise
                 logging.warning(e)
                 logging.warning(
                     "\033[91m"
                     + f"CAN Error {self.name}: Failed to communicate with motor {id} over can bus. Retrying..."
                     + "\033[0m"
                 )
-            time.sleep(0.001)
+            if deadline is not None:
+                if attempt + 1 == attempts:
+                    raise TimeoutError(f"CAN motion deadline: no reply from motor {motor_id} on {self.name}")
+            else:
+                time.sleep(0.001)
         raise AssertionError(
             f"fail to communicate with the motor {id} on {self.name} at can channel {self.bus.channel_info}"
         )
@@ -97,19 +156,14 @@ class CanInterface:
         Raises:
             AssertionError: If no message is received within the timeout.
         """
-        start_time = time.time()
-        while (time.time() - start_time) < timeout:
-            if self.use_buffered_reader:
-                # Use BufferedReader to get the message
-                message = self.buffered_reader.get_message(timeout=0.002)
-            else:
-                message = self.bus.recv(timeout=0.002)
-            if message:
-                return message
-            else:
-                message = self.bus.recv(timeout=0.0008)
-                if message:
-                    return message
+        # The socket/reader already waits; polling every millisecond needlessly
+        # reacquires the interpreter lock while another thread runs IK.
+        if self.use_buffered_reader:
+            message = self.buffered_reader.get_message(timeout=max(0.0, timeout))
+        else:
+            message = self.bus.recv(timeout=max(0.0, timeout))
+        if message is not None:
+            return message
         if not supress_warning:
             logging.warning(
                 "\033[91m"
