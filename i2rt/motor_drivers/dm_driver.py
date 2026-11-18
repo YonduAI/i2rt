@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import struct
@@ -23,6 +24,20 @@ from i2rt.motor_drivers.utils import (
 )
 from i2rt.utils.encoder_manager import EncoderConfig, PassiveJointEncoder
 from i2rt.utils.utils import RateRecorder
+
+
+def _fault_frame(frame: can.Message | None) -> dict[str, Any] | None:
+    if frame is None:
+        return None
+    return {
+        "can_id": frame.arbitration_id,
+        "data_hex": frame.data.hex(),
+        "dlc": frame.dlc,
+        "timestamp_ns": int(frame.timestamp * 1e9) if np.isfinite(frame.timestamp) else None,
+        "is_error_frame": frame.is_error_frame,
+        "is_extended_id": frame.is_extended_id,
+        "is_remote_frame": frame.is_remote_frame,
+    }
 
 log_level = os.getenv("LOGLEVEL", "ERROR").upper()
 
@@ -252,8 +267,10 @@ class DMSingleMotorCanInterface(CanInterface):
         """
         id = self._get_frame_id(motor_id)
         data = [0xFF] * 7 + [0xFD]
+        self.disable_reply = None
         for _ in range(3):
             message = self._send_message_get_response(id, motor_id, data)
+            self.disable_reply = message
             code = message.data[0] >> 4
             if code == MotorErrorCode.disabled:
                 return
@@ -812,6 +829,27 @@ class DMChainCanInterface(MotorChain):
                     **({"deadline": deadline} if deadline is not None else {}),
                 )
             except Exception as e:
+                interface = self.motor_interface
+                self._fault_batch = {
+                    "motor_id": motor_id,
+                    "motor_type": motor_type,
+                    "elapsed_ms": (time.monotonic() - cycle_started) * 1000,
+                    "cycle_budget_ms": timeout * 1000 if timeout is not None else None,
+                    "completed_transactions": transactions,
+                    "partial_motor_reports": [vars(report) for report in motor_feedback],
+                }
+                if (
+                    getattr(interface, "motion_motor_id", None) == motor_id
+                    and interface.motion_started_monotonic_ns >= int(cycle_started * 1e9)
+                ):
+                    self._fault_batch.update(
+                        transaction_started_timestamp_ns=interface.motion_started_timestamp_ns,
+                        expected_reply_id=interface.motion_expected_id,
+                        attempts_sent=interface.motion_attempts,
+                        request=_fault_frame(interface.motion_request),
+                        matching_frame=_fault_frame(interface.motion_reply),
+                        controller_error_frame=_fault_frame(interface.motion_error_frame),
+                    )
                 logging.error(f"{idx}th motor at DMChainCanInterface {self} failed with info {motor_info}")
                 raise e
 
@@ -901,14 +939,42 @@ class DMChainCanInterface(MotorChain):
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join()
         errors = []
+        fault_reason = getattr(self, "fault_error", None)
+        disable_reports = []
         try:
             for motor_id, _ in self.motor_list:
+                error = None
                 try:
                     self.motor_interface.motor_off(motor_id)
                 except Exception as exc:
+                    error = str(exc)
                     errors.append(f"{motor_id}: {exc}")
+                if fault_reason:
+                    disable_reports.append({
+                        "motor_id": motor_id,
+                        "confirmed": error is None,
+                        "error": error,
+                        "reply": _fault_frame(getattr(self.motor_interface, "disable_reply", None)),
+                    })
         finally:
-            self.motor_interface.close()
+            try:
+                self.motor_interface.close()
+            finally:
+                if fault_reason:
+                    logging.error(
+                        "CAN arm fault report: %s",
+                        json.dumps(
+                            {
+                                "channel": self.channel,
+                                "error": fault_reason,
+                                "failed_batch": getattr(self, "_fault_batch", None),
+                                "last_completed_batch": self.last_applied_command,
+                                "last_motor_reports": [vars(report) for report in self.state or []],
+                                "disable_reports": disable_reports,
+                            },
+                            default=str,
+                        ),
+                    )
         if errors:
             self._close_error = "Motor disable failed: " + "; ".join(errors)
             raise RuntimeError(self._close_error)

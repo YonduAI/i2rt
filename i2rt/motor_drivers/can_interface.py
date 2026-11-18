@@ -63,11 +63,22 @@ class CanInterface:
         attempts = min(max_retry, 2) if deadline is not None else max_retry
         send_time = time.monotonic_ns()
         send_wall_time = time.time_ns()
+        if deadline is not None:
+            self.motion_motor_id = motor_id
+            self.motion_request = message
+            self.motion_started_timestamp_ns = send_wall_time
+            self.motion_started_monotonic_ns = send_time
+            self.motion_expected_id = expected_id
+            self.motion_attempts = 0
+            self.motion_reply = None
+            self.motion_error_frame = None
         for attempt in range(attempts):
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"CAN motion deadline expired before motor {motor_id} on {self.name}")
             try:
                 self.bus.send(message)
+                if deadline is not None:
+                    self.motion_attempts = attempt + 1
                 reply_timeout = 0.005 if deadline is not None and attempt == 0 and attempts > 1 else 0.2
                 reply_deadline = (
                     min(deadline, time.monotonic() + reply_timeout)
@@ -76,6 +87,11 @@ class CanInterface:
                 )
                 while (remaining := reply_deadline - time.monotonic()) > 0:
                     response = self._receive_message(motor_id, timeout=remaining, supress_warning=deadline is not None)
+                    if deadline is not None and response is not None:
+                        if response.is_error_frame:
+                            self.motion_error_frame = response
+                        elif response.arbitration_id == expected_id:
+                            self.motion_reply = response
                     if deadline is not None and time.monotonic() >= deadline:
                         raise TimeoutError(f"CAN motion deadline expired waiting for motor {motor_id} on {self.name}")
                     if response is None:

@@ -1,5 +1,6 @@
 """Recover one lost reply without extending a motion batch's original deadline."""
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -105,12 +106,16 @@ def test_stream_encoding_passes_deadline_with_one_bounded_retry(monkeypatch: pyt
     assert calls == [{"max_retry": 2, "deadline": 10.02}]
 
 
-def test_whole_chain_has_one_budget_and_never_advances_after_missing_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_whole_chain_has_one_budget_and_never_advances_after_missing_reply(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
     import numpy as np
 
     from i2rt.motor_drivers.dm_driver import DMChainCanInterface, MotorCmd
 
-    obj, clock, bus = interface(monkeypatch, [(0.002, reply())])
+    short = can.Message(arbitration_id=0x12, is_extended_id=False, timestamp=1010.003, data=[0x12])
+    stuff = can.Message(arbitration_id=0x8, is_error_frame=True, timestamp=1010.004, data=[0, 0, 4])
+    obj, clock, bus = interface(monkeypatch, [(0.002, reply()), (0.001, short), (0.001, stuff)])
     obj.__class__ = DMSingleMotorCanInterface
     obj.control_mode = ControlMode.MIT
     obj.cmd_idoffset = 0
@@ -122,12 +127,40 @@ def test_whole_chain_has_one_budget_and_never_advances_after_missing_reply(monke
     chain.channel = "fake"
     chain.control_cycle_timeout = 0.01
     chain.last_applied_command = None
+    chain.state = [obj.parse_recv_message(reply(joint), MotorType.DM4310) for joint in range(1, 7)]
+    chain._thread = None
+    chain._closed = False
     commands = [MotorCmd(pos=0.0, vel=0.0, kp=0.0, kd=0.0, torque=0.0) for _ in range(6)]
     with pytest.raises(TimeoutError, match="motor 2"):
         chain._set_commands(commands)
     assert [m.arbitration_id for m in bus.sent] == [1, 2, 2]
     assert clock.now == pytest.approx(10.01)
     assert chain.last_applied_command is None
+
+    # Shutdown uses its existing exchanges and emits the frozen fault context once.
+    for motor in range(1, 7):
+        disabled = reply(motor)
+        disabled.data[0] = motor
+        bus.replies.append((0.001, disabled))
+    chain.fault_error = "motor 2 timed out"
+    socket_closed = []
+    obj.close = lambda: socket_closed.append(True)
+    chain.close()
+    chain.close()
+
+    assert socket_closed == [True]
+    assert [m.arbitration_id for m in bus.sent] == [1, 2, 2, 1, 2, 3, 4, 5, 6]
+    logs = [message for message in caplog.messages if message.startswith("CAN arm fault report: ")]
+    assert len(logs) == 1
+    report = json.loads(logs[0].removeprefix("CAN arm fault report: "))
+    assert [motor["id"] for motor in report["last_motor_reports"]] == list(range(1, 7))
+    failed = report["failed_batch"]
+    assert failed["motor_id"] == 2 and failed["attempts_sent"] == 2
+    assert failed["matching_frame"]["data_hex"] == "12"
+    assert failed["controller_error_frame"]["is_error_frame"]
+    assert failed["partial_motor_reports"][0]["id"] == 1
+    assert failed["cycle_budget_ms"] == 10.0
+    assert all(motor["confirmed"] and motor["reply"]["dlc"] == 8 for motor in report["disable_reports"])
 
 
 def test_lost_reply_recovers_same_target_without_enabling_or_extending_deadline(
