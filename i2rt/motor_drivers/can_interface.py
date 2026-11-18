@@ -132,7 +132,7 @@ class CanInterface:
                 logging.warning(e)
                 logging.warning(
                     "\033[91m"
-                    + f"CAN Error {self.name}: Failed to communicate with motor {id} over can bus. Retrying..."
+                    + f"CAN Error {self.name}: Failed to communicate with motor {motor_id} over can bus. Retrying..."
                     + "\033[0m"
                 )
             if deadline is not None:
@@ -141,7 +141,8 @@ class CanInterface:
             else:
                 time.sleep(0.001)
         raise AssertionError(
-            f"fail to communicate with the motor {id} on {self.name} at can channel {self.bus.channel_info}"
+            f"fail to communicate with the motor {motor_id} on {self.name} at can channel {self.bus.channel_info} "
+            f"(request CAN ID {id:#x})"
         )
 
     def try_receive_message(self, motor_id: Optional[int] = None, timeout: float = 0.009) -> Optional[can.Message]:

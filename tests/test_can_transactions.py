@@ -60,6 +60,6 @@ def test_missing_expected_reply_still_times_out_and_raises(monkeypatch: pytest.M
 
     interface._receive_message = unrelated
     interface.try_receive_message = Mock()
-    with pytest.raises(AssertionError, match="fail to communicate"):
-        interface._send_message_get_response(1, 1, [0] * 8, max_retry=2)
+    with pytest.raises(AssertionError, match=r"motor 2.*request CAN ID 0x7ff"):
+        interface._send_message_get_response(0x7FF, 2, [2, 0, 0xCC, 0, 0, 0, 0, 0], max_retry=2)
     assert interface.bus.send.call_count == 2
